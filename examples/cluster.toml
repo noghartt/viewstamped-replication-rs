@@ -1,0 +1,4 @@
+version = 1
+
+[[replica]]
+address = "127.0.0.1:8001"
