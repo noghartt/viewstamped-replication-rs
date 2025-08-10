@@ -3,5 +3,11 @@ resolver = "3"
 members  = ["crates/*"]
 
 [workspace.dependencies]
-vr-replica = { path = "crates/vr-replica" }
+clap = { version = "4.5.43", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+tokio = { version = "1", features = ["full"] }
 vr-proxy = { path = "crates/vr-proxy" }

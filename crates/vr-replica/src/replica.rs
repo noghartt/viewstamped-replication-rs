@@ -55,20 +55,20 @@ struct ClientRequest {
 #[derive(Clone, Debug)]
 pub struct Replica {
     /// A sorted array containing the IP addresses of the replicas in the system.
-    configuration: Vec<String>,
+    pub configuration: Vec<String>,
     /// The unique identifier of the replica in the system. The index of the replica in the `configuration` array.
-    replica_number: usize,
+    pub replica_number: usize,
     /// The view number determines who is the primary replica in the current view.
-    view_number: usize,
-    status: ReplicaStatus,
+    pub view_number: usize,
+    pub status: ReplicaStatus,
     /// The most recently received request. By default, this is set to 0.
-    op_number: usize,
+    pub op_number: usize,
     /// The number of the most recently committed request.
-    commit_number: usize,
+    pub commit_number: usize,
     /// An array containing `op_number` entries. The entries contain the requests that have been received so far in their assigned order.
-    log: Vec<usize>,
+    pub log: Vec<usize>,
     /// A map containing the client requests. The key is a combination of the client ID and request ID.
-    client_table: HashMap<String, ClientRequest>,
+    pub client_table: HashMap<String, ClientRequest>,
 }
 
 impl Replica {
