@@ -7,13 +7,13 @@ use tokio::net::TcpStream;
 
 pub struct Proxy {
     /// A sorted array containing the IP addresses of the replicas in the system.
-    configuration: Vec<String>,
+    pub configuration: Vec<String>,
     /// The current view number. The primary replica is the one with the index `current_view` in the `configuration` array.
-    current_view: usize,
+    pub current_view: usize,
     /// The unique identifier of this client.
-    id: String,
+    pub id: String,
     /// The current request number. For future requests, it should ensure to be greater than the previous request number.
-    request_number: u64,
+    pub request_number: u64,
 }
 
 impl Proxy {
