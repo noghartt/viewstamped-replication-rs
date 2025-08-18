@@ -2,3 +2,9 @@ version = 1
 
 [[replica]]
 address = "127.0.0.1:8001"
+
+[[replica]]
+address = "127.0.0.1:8002"
+
+[[replica]]
+address = "127.0.0.1:8003"

@@ -8,11 +8,11 @@ use tokio::net::TcpListener;
 use crate::request::handle_request;
 
 #[derive(Clone, Debug)]
-struct ReplicaRequest {
-    client_id: String,
-    request_id: usize,
-    // TODO: The op is the operation + arguments, not sure yet how we will structure it.
-    op: ()
+pub struct ReplicaRequest {
+    pub client_id: String,
+    pub request_id: usize,
+    pub op: Vec<String>,
+    pub result: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +42,7 @@ enum ReplicaStatus {
     Normal,
     ViewChange,
     Recovering,
+    Transitioning,
 }
 
 #[derive(Clone, Debug)]
@@ -60,15 +61,17 @@ pub struct Replica {
     pub replica_number: usize,
     /// The view number determines who is the primary replica in the current view.
     pub view_number: usize,
+    /// The current epoch number of the replica. Which means the number of times the replica group has been reconfigured.
+    pub epoch: usize,
     pub status: ReplicaStatus,
     /// The most recently received request. By default, this is set to 0.
     pub op_number: usize,
     /// The number of the most recently committed request.
     pub commit_number: usize,
     /// An array containing `op_number` entries. The entries contain the requests that have been received so far in their assigned order.
-    pub log: Vec<usize>,
-    /// A map containing the client requests. The key is a combination of the client ID and request ID.
-    pub client_table: HashMap<String, ClientRequest>,
+    pub log: Vec<ReplicaRequest>,
+    /// The client table is a map containing the last client request for each client which has been processed by the replica.
+    pub client_table: HashMap<String, ReplicaRequest>,
 }
 
 impl Replica {
@@ -78,10 +81,11 @@ impl Replica {
         Replica {
             configuration,
             replica_number,
-            view_number: usize::default(),
+            view_number: 0,
+            op_number: 0,
+            commit_number: 0,
+            epoch: 0,
             status: ReplicaStatus::Normal,
-            op_number: usize::default(),
-            commit_number: usize::default(),
             log: Vec::new(),
             client_table: HashMap::new(),
         }
