@@ -1,3 +1,4 @@
+use tokio::net::TcpListener;
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::process::Command;
@@ -5,6 +6,7 @@ use std::process::Command;
 mod replica;
 mod config;
 mod request;
+mod message;
 
 #[derive(ValueEnum, Clone)]
 enum Mode {
@@ -69,14 +71,18 @@ fn run_cluster(config: config::Config, path: String) {
     }
 }
 
-fn run_replica(config: config::Config, index: usize) {
+#[tokio::main]
+async fn run_replica(config: config::Config, index: usize) {
     let replica_addresses = config.replicas
         .iter()
         .map(|replica| replica.address.clone())
         .collect::<Vec<String>>();
 
-    let mut replica = replica::Replica::new(replica_addresses, index);
-    let _ = replica.start();
+    let replica = replica::Replica::new(replica_addresses, index);
+    let app = replica.get_router();
+
+    let listener = TcpListener::bind(replica.address).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 
     println!("Replica {} started", index);
 }

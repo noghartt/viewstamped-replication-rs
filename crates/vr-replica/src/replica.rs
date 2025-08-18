@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use axum::routing::{get, post};
+use axum::Router;
 
 use crate::request::handle_request;
 
@@ -12,7 +10,7 @@ pub struct ReplicaRequest {
     pub client_id: String,
     pub request_id: usize,
     pub op: Vec<String>,
-    pub result: Option<String>,
+    pub result: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +53,7 @@ struct ClientRequest {
 
 #[derive(Clone, Debug)]
 pub struct Replica {
+    pub address: String,
     /// A sorted array containing the IP addresses of the replicas in the system.
     pub configuration: Vec<String>,
     /// The unique identifier of the replica in the system. The index of the replica in the `configuration` array.
@@ -78,7 +77,9 @@ impl Replica {
     pub fn new(configuration: Vec<String>, replica_number: usize) -> Self {
         let mut configuration = configuration.clone();
         configuration.sort();
+        let address = configuration.get(replica_number).unwrap().clone();
         Replica {
+            address,
             configuration,
             replica_number,
             view_number: 0,
@@ -91,29 +92,12 @@ impl Replica {
         }
     }
 
-    #[tokio::main(flavor = "multi_thread")]
-    pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let address = self.configuration.get(self.replica_number).unwrap();
-        let listener = TcpListener::bind(address).await?;
-
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-
-            let state = self.clone();
-
-            tokio::task::spawn(async move {
-                let service = service_fn(move |req| {
-                    handle_request(req, state.clone())
-                });
-
-                if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                    eprintln!("Error serving connection: {}", e);
-                }
-            });
-        }
+    pub fn get_router(&self) -> Router {
+        Router::new()
+            .route("/", get(|| async { "Hello, World!" }))
+            .route("/", post(handle_request))
+            .with_state(self.clone())
     }
-
 }
 
 #[cfg(test)]

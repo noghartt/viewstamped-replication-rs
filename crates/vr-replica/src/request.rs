@@ -1,136 +1,63 @@
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Buf, Bytes};
-use hyper::client::conn::http1::SendRequest;
-use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
+use axum::extract::State;
+use axum::{Json, http::StatusCode};
 
+use crate::message::{Message, PrepareData};
 use crate::replica::{Replica, ReplicaRequest};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type Op = Vec<String>;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum RequestType {
-    Connect,
-    Request { op: Op, client_id: String, request_number: usize },
-    Prepare(PrepareData),
+pub async fn handle_request(State(replica): State<Replica>, data: Json<Message>) -> (StatusCode, Json<Message>) {
+    match data.0 {
+        Message::Connect { .. } => handle_client_connection(replica),
+        Message::Request { client_id, op, request_number } => handle_client_request(replica, client_id, request_number, op).await,
+        Message::Prepare(prepare_data) => on_prepare(replica, prepare_data).await,
+        _ => (StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "Invalid request".to_string(),
+        })),
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PrepareData {
-    op: Op,
-    view_number: usize,
-    op_number: usize,
-    commit_number: usize,
-}
-
-// TODO: Validate if the `i` in the PrepareOk response mentioned in the paper means the replica number.
-#[derive(Debug, Serialize, Deserialize)]
-struct PrepareOkData {
-    r#type: String,
-    view_number: usize,
-    op_number: usize,
-    replica_number: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReplyData {
-    view_number: usize,
-    request_number: usize,
-    result: Vec<String>,
-}
-
-pub async fn handle_request(req: Request<hyper::body::Incoming>, replica: Replica) -> Result<Response<Full<Bytes>>> {
-    let body = req.collect().await?.aggregate();
-    let data = match serde_json::from_reader::<_, RequestType>(body.reader()) {
-        Ok(data) => data,
-        Err(e) => { 
-            let response = Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Full::new(Bytes::from(format!("Invalid request: {:?}", e))))?;
-            
-            return Ok(response);
-        }
+fn handle_client_connection(replica: Replica) -> (StatusCode, Json<Message>) {
+    if replica.replica_number != replica.view_number {
+        return (StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "Replica is not the primary replica in the current view".to_string(),
+        }));
+    }
+    
+    let response = Message::Connect {
+        configuration: replica.configuration,
+        current_view: replica.view_number,
+        epoch: replica.epoch,
     };
     
-    match data {
-        RequestType::Connect => handle_client_connection(replica),
-        RequestType::Request { client_id, op, request_number } => handle_client_request(replica, client_id, request_number, op).await,
-        RequestType::Prepare(prepare_data) => on_prepare(replica, prepare_data).await,
-    }
+    (StatusCode::OK, Json(response))
 }
 
-fn handle_client_connection(replica: Replica) -> Result<Response<Full<Bytes>>> {
-    if replica.replica_number != replica.view_number {
-        let response = Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from("Replica is not the primary replica in the current view")))
-        .unwrap();
-        
-        return Ok(response);
-    }
-    
-    #[derive(Serialize)]
-    struct Data {
-        configuration: Vec<String>,
-        current_view: usize,
-        epoch: usize,
-    }
-    
-    let bytes = Bytes::from(serde_json::to_string(&Data {
-        current_view: replica.view_number,
-        configuration: replica.configuration,
-        epoch: replica.epoch,
-    })?);
-    
-    let response = Response::builder()
-    .status(StatusCode::OK)
-    .body(Full::new(bytes))?;
-    
-    Ok(response)
-}
-
-async fn handle_client_request(mut replica: Replica, client_id: String, request_number: usize, op: Vec<String>) -> Result<Response<Full<Bytes>>> {
-    println!("handle_client_request: {:?}", request_number);
-    println!("replica.op_number: {:?}", replica.op_number);
-    println!("replica.log: {:?}", replica.log);
-    println!("replica.client_table: {:?}", replica.client_table);
-    
+async fn handle_client_request(mut replica: Replica, client_id: String, request_number: usize, op: Vec<String>) -> (StatusCode, Json<Message>) {
     // TODO: Check the `epoch` to validate if it's an old client which requests to be reconfigured.
     if replica.replica_number != replica.view_number {
-        let response = Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from("Replica is not the primary replica in the current view")))
-        .unwrap();
-        
-        return Ok(response);
+        return (StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "Replica is not the primary replica in the current view".to_string(),
+        }));
     }
     
     if request_number < replica.op_number {
-        let response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Full::new(Bytes::from("Request not processed")))
-        .unwrap();
-        
-        return Ok(response);
+        return (StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "Request number is less than the current op number".to_string(),
+        }));
     }
     
     
     let cached_response = if request_number == replica.op_number {
         if let Some(request) = replica.log.get(request_number) {
             if let Some(result) = &request.result {
-                Some(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Full::new(Bytes::from(result.clone())))
-                    .unwrap())
+                Some(Json(Message::Reply {
+                    view_number: replica.view_number,
+                    request_id: request_number,
+                    result: Some(result.clone()),
+                }))
             } else {
-                Some(Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Full::new(Bytes::from("Request not processeed")))
-                    .unwrap())
+                Some(Json(Message::Error {
+                    message: "Request not processed".to_string(),
+                }))
             }
         } else {
             None
@@ -140,7 +67,7 @@ async fn handle_client_request(mut replica: Replica, client_id: String, request_
     };
 
     if let Some(response) = cached_response {
-        return Ok(response);
+        return (StatusCode::OK, response);
     }
     
     let request = ReplicaRequest {
@@ -153,11 +80,16 @@ async fn handle_client_request(mut replica: Replica, client_id: String, request_
     replica.op_number += 1;
     replica.log.push(request.clone());
     replica.client_table.entry(request.client_id.clone()).or_insert(request.clone());
-    
-    prepare_request_for_replicas(replica, request).await
+
+    match prepare_request_for_replicas(replica, request).await {
+        Ok(response) => response,
+        Err(_) => (StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "Prepare request failed".to_string(),
+        })),
+    }   
 }
 
-async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest) -> Result<Response<Full<Bytes>>> {
+async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest) -> Result<(StatusCode, Json<Message>), ()> {
     let replicas_addresses = replica.configuration
     .iter()
     .enumerate()
@@ -173,27 +105,19 @@ async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest)
     
     let mut prepare_acks = Vec::new();
     for (addr, mut sender) in senders {
-        let prepare_data = PrepareData {
+        let prepare_data = Message::Prepare(PrepareData {
             op: request.op.clone(),
             view_number: replica.view_number,
             op_number: replica.op_number,
             commit_number: replica.commit_number,
-        };
+        });
 
-        let request_data = RequestType::Prepare(prepare_data);
+        // TODO: It needs to check for timeout and guarantee the response struct of the replica response.
+        let request_data_json = serde_json::to_string(&prepare_data).unwrap();
+        let result = reqwest::Client::new().post(format!("http://{}/", addr)).body(request_data_json).send().await.unwrap();
+        let data = result.json::<>().await.unwrap();
 
-        let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("http://{}/", addr))
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(serde_json::to_string(&request_data)?)))?;
-
-        let res = sender.send_request(req).await?;
-
-        let body = res.collect().await?.aggregate();
-        let data = serde_json::from_reader::<_, PrepareOkData>(body.reader());
-
-        prepare_acks.push(data);
+        prepare_acks.push(Ok(data));
     }
     
     let prepare_ack_success = prepare_acks.iter().filter(|ack| ack.is_ok()).collect::<Vec<_>>();
@@ -203,67 +127,34 @@ async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest)
 
     // TODO: Should we rollback the request if the prepare request fails?
     if prepare_ack_success.len() < quorum {
-        let response = Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from("Prepare request failed: quorum not reached")))
-        .unwrap();
-        
-        return Ok(response);
+        return Ok((StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "Prepare request failed: quorum not reached".to_string(),
+        })));
     }
     
-    let reply_data = ReplyData {
+    let reply_data = Message::Reply {
         view_number: replica.view_number,
-        request_number: replica.op_number,
-        result: request.op.clone(),
+        request_id: replica.op_number,
+        result: Some(request.op.clone()),
     };
-    
-    let bytes = Bytes::from(serde_json::to_string(&reply_data)?);
-    let response = Response::builder()
-    .status(StatusCode::OK)
-    .body(Full::new(bytes))?;
 
-    Ok(response)
+    Ok((StatusCode::OK, Json(reply_data)))
 }
 
 // TODO: Implement the rest of the flow.
-async fn on_prepare(replica: Replica, data: PrepareData) -> Result<Response<Full<Bytes>>> {
+async fn on_prepare(replica: Replica, data: PrepareData) -> (StatusCode, Json<Message>) {
     println!("on_prepare: {:?}", data);
     if data.view_number != replica.view_number {
-        let response = Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from("View number mismatch")))
-        .unwrap();
-        
-        return Ok(response);
+        return (StatusCode::BAD_REQUEST, Json(Message::Error {
+            message: "View number mismatch".to_string(),
+        }));
     }
     
-    let ok = PrepareOkData {
-        r#type: "prepare_ok".to_string(),
+    let ok = Message::PrepareOk {
         view_number: replica.view_number,
         op_number: replica.op_number,
         replica_number: replica.replica_number,
     };
 
-    println!("ok: {:?}", ok);
-    
-    let response = Response::builder()
-    .status(StatusCode::OK)
-    .body(Full::new(Bytes::from(serde_json::to_string(&ok)?)))
-    .unwrap();
-    
-    Ok(response)
-}
-
-async fn get_sender_by_addr(addr: &str) -> Result<SendRequest<Full<Bytes>>> {
-    let stream = TcpStream::connect(addr).await?;
-    let io = TokioIo::new(stream);
-    let (sender, conn) = hyper::client::conn::http1::handshake::<_, Full<Bytes>>(io).await?;
-    
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            eprintln!("Connection failed: {:?}", err);
-        }
-    });
-    
-    Ok(sender)
+    (StatusCode::OK, Json(ok))
 }
