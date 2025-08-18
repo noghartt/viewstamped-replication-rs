@@ -1,10 +1,12 @@
-use axum::extract::State;
-use axum::{Json, http::StatusCode};
+use axum::extract::{Request, State};
+use axum::{Json, http::{Method, StatusCode}};
 
-use crate::message::{Message, PrepareData};
-use crate::replica::{Replica, ReplicaRequest};
+use crate::message::{Message, PrepareData, PrepareOkData};
+use crate::replica::{Replica, ReplicaRequest, ReplicaState};
 
-pub async fn handle_request(State(replica): State<Replica>, data: Json<Message>) -> (StatusCode, Json<Message>) {
+pub async fn handle_request(State(state): State<ReplicaState>, data: Json<Message>) -> (StatusCode, Json<Message>) {
+    let replica = state.replica;
+
     match data.0 {
         Message::Connect { .. } => handle_client_connection(replica),
         Message::Request { client_id, op, request_number } => handle_client_request(replica, client_id, request_number, op).await,
@@ -96,15 +98,11 @@ async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest)
     .filter(|(i, _)| *i != replica.replica_number)
     .map(|(_, addr)| addr)
     .collect::<Vec<_>>();
+
+    println!("Replicas addresses: {:?}", replicas_addresses);
     
-    let mut senders = Vec::new();
+    let mut prepare_acks: Vec<Result<PrepareOkData, ()>> = Vec::new();
     for addr in replicas_addresses.clone() {
-        let sender = get_sender_by_addr(addr).await?;
-        senders.push((addr, sender))
-    }
-    
-    let mut prepare_acks = Vec::new();
-    for (addr, mut sender) in senders {
         let prepare_data = Message::Prepare(PrepareData {
             op: request.op.clone(),
             view_number: replica.view_number,
@@ -114,8 +112,17 @@ async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest)
 
         // TODO: It needs to check for timeout and guarantee the response struct of the replica response.
         let request_data_json = serde_json::to_string(&prepare_data).unwrap();
-        let result = reqwest::Client::new().post(format!("http://{}/", addr)).body(request_data_json).send().await.unwrap();
-        let data = result.json::<>().await.unwrap();
+        println!("Data: {}, addr: {}", request_data_json, addr);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .header("Content-Type", "application/json")
+            .uri(format!("http://{}/", addr))
+            .body(request_data_json.into())
+            .unwrap();
+
+        let result = replica.rpc.get().unwrap().send_request(addr, request).await.unwrap();
+        let data = serde_json::from_slice::<PrepareOkData>(&result.body()).unwrap();
 
         prepare_acks.push(Ok(data));
     }
@@ -143,18 +150,18 @@ async fn prepare_request_for_replicas(replica: Replica, request: ReplicaRequest)
 
 // TODO: Implement the rest of the flow.
 async fn on_prepare(replica: Replica, data: PrepareData) -> (StatusCode, Json<Message>) {
-    println!("on_prepare: {:?}", data);
+    println!("on_prepare: {:?} {:?}", data, replica);
     if data.view_number != replica.view_number {
         return (StatusCode::BAD_REQUEST, Json(Message::Error {
             message: "View number mismatch".to_string(),
         }));
     }
     
-    let ok = Message::PrepareOk {
+    let ok = Message::PrepareOk(PrepareOkData {
         view_number: replica.view_number,
         op_number: replica.op_number,
-        replica_number: replica.replica_number,
-    };
+        commit_number: replica.commit_number,
+    });
 
     (StatusCode::OK, Json(ok))
 }

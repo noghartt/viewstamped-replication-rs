@@ -2,11 +2,13 @@ use tokio::net::TcpListener;
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::process::Command;
+use std::sync::Arc;
 
 mod replica;
 mod config;
 mod request;
 mod message;
+mod rpc;
 
 #[derive(ValueEnum, Clone)]
 enum Mode {
@@ -55,7 +57,7 @@ fn run_cluster(config: config::Config, path: String) {
     let mut children = Vec::new();
     for index in 0..replica_addresses.len() {
         println!("Starting replica {}", index);
-        let mut child = Command::new(&exe)
+        let child = Command::new(&exe)
             .arg("--path").arg(path.clone())
             .arg("--mode").arg("replica")
             .arg("--index").arg(index.to_string())
@@ -79,7 +81,10 @@ async fn run_replica(config: config::Config, index: usize) {
         .collect::<Vec<String>>();
 
     let replica = replica::Replica::new(replica_addresses, index);
-    let app = replica.get_router();
+    let app = replica::create_router_for_replica(replica.clone());
+
+    let rpc = rpc::ReqwestRpc::new();
+    replica.set_rpc(Arc::new(rpc));
 
     let listener = TcpListener::bind(replica.address).await.unwrap();
     axum::serve(listener, app).await.unwrap();

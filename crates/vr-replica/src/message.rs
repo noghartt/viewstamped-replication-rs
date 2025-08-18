@@ -11,6 +11,13 @@ pub struct PrepareData {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct PrepareOkData {
+  pub view_number: usize,
+  pub op_number: usize,
+  pub commit_number: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
   Error {
@@ -32,9 +39,5 @@ pub enum Message {
     result: Option<Vec<String>>,
   },
   Prepare(PrepareData),
-  PrepareOk {
-    view_number: usize,
-    op_number: usize,
-    replica_number: usize,
-  }
+  PrepareOk(PrepareOkData),
 }
