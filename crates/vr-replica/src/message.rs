@@ -1,43 +1,45 @@
-use serde::{Deserialize, Serialize};
+use crate::state_machine::StateMachine;
+use crate::types::ReplicaId;
 
-type Op = Vec<String>;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PrepareData {
-  pub op: Op,
-  pub view_number: usize,
-  pub op_number: usize,
-  pub commit_number: usize,
+#[derive(Clone, Debug)]
+pub struct ClientRequest<SM: StateMachine> {
+    pub op: SM::Input,
+    pub client_id: String,
+    pub request_number: usize,
+    pub result: Option<SM::Output>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PrepareOkData {
-  pub view_number: usize,
-  pub op_number: usize,
-  pub commit_number: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Message {
+pub enum Message<SM: StateMachine> {
   Error {
     message: String,
   },
-  Request { 
-    op: Op,
-    client_id: String,
-    request_number: usize,
-  },
+  Request(ClientRequest<SM>),
   Connect {
     configuration: Vec<String>,
     current_view: usize,
     epoch: usize,
   },
   Reply {
-    view_number: usize,
+    view_number: ReplicaId,
     request_id: usize,
-    result: Option<Vec<String>>,
+    result: Option<SM::Output>,
   },
-  Prepare(PrepareData),
-  PrepareOk(PrepareOkData),
+  Prepare {
+    op: SM::Input,
+    view_number: ReplicaId,
+    op_number: usize,
+    commit_number: usize,
+    request: Box<ClientRequest<SM>>,
+  },
+  PrepareOk {
+    view_number: ReplicaId,
+    replica_number: ReplicaId,
+    op_number: usize,
+    commit_number: usize,
+  },
+  Commit {
+    op_number: usize,
+    commit_number: usize,
+    view_number: ReplicaId,
+  }
 }
