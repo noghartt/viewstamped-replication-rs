@@ -17,8 +17,15 @@ pub struct Client<T> {
     pub state: T,
 }
 
-type State = HashMap<String, u64>;
+impl Client<State> {
+    pub fn new(id: NodeId) -> Self {
+        Self { id, state: HashMap::new() }
+    }
+}
+
+pub type State = HashMap<String, u64>;
 impl StateMachine for Client<State> {
+    type State = State;
     type Input = Op;
     type Output = ();
 

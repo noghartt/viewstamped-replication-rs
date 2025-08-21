@@ -4,8 +4,27 @@ use vr_replica::{clock::TimerKind, effect::Effect, message::Message, replica::Re
 
 use crate::{client::Client, events::Event};
 
+#[derive(Clone)]
+pub struct Links(pub HashMap<(NodeKind, NodeKind), Link>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Links {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for ((a, b), l) in &self.0 {
+            write!(f, "{:?} -> {:?} -> {:?}\n", a, b, l)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NodeKind {
+    Client(NodeId),
+    Replica(NodeId),
+}
 
 #[derive(Debug, Clone)]
 pub struct Link {
@@ -29,9 +48,9 @@ pub struct Simulator<SM: StateMachine> {
 
     replicas: HashMap<NodeId, Replica<SM>>,
     inbox: HashMap<NodeId, VecDeque<Event<SM>>>,
-    links: HashMap<(NodeId, NodeId), Link>,
+    links: Links,
 
-    clients: HashMap<NodeId, Client<SM::Input>>,
+    clients: HashMap<NodeId, Client<SM::State>>,
     client_inbox: HashMap<NodeId, VecDeque<SM::Input>>,
 }
 
@@ -42,10 +61,22 @@ impl <SM: StateMachine> Simulator<SM> {
             wheel: BTreeMap::new(),
             replicas: HashMap::new(),
             inbox: HashMap::new(),
-            links: HashMap::new(),
+            links: Links(HashMap::new()),
             clients: HashMap::new(),
             client_inbox: HashMap::new(),
         }
+    }
+
+    pub fn get_clients(&self) -> Vec<Client<SM::State>> {
+        self.clients.values().cloned().collect()
+    }
+
+    pub fn get_replicas(&self) -> Vec<Replica<SM>> {
+        self.replicas.values().cloned().collect()
+    }
+
+    pub fn get_links(&self) -> Links {
+        self.links.clone()
     }
 
     pub fn add_replica(&mut self, id: NodeId, r: Replica<SM>) {
@@ -55,13 +86,14 @@ impl <SM: StateMachine> Simulator<SM> {
         self.schedule(self.now, WheelEvent::FireTimer { node: id, kind: TimerKind::BackupWatchdog });
     }
 
-    pub fn add_client(&mut self, id: NodeId, c: Client<SM::Input>) {
+    pub fn add_client(&mut self, id: NodeId, c: Client<SM::State>) {
         self.clients.insert(id, c);
+        self.client_inbox.insert(id, VecDeque::new());
     }
 
-    pub fn set_link(&mut self, src: NodeId, dst: NodeId, link: Link) {
-        self.links.insert((src, dst), link.clone());
-        self.links.insert((dst, src), link.clone());
+    pub fn set_link(&mut self, src: NodeKind, dst: NodeKind, link: Link) {
+        self.links.0.insert((src, dst), link.clone());
+        self.links.0.insert((dst, src), link.clone());
     }
 
     pub fn run(&mut self) {
@@ -110,7 +142,7 @@ impl <SM: StateMachine> Simulator<SM> {
     }
 
     fn send(&mut self, from: NodeId, to: NodeId, m: Message<SM>) {
-        let Some(l) = self.links.get(&(from, to)) else {
+        let Some(l) = self.get_link_with_node_id(&from, &to) else {
             return;
         };
 
@@ -118,10 +150,23 @@ impl <SM: StateMachine> Simulator<SM> {
             return;
         }
 
+        let base_ms = l.base_ms;
         // TODO: Add jitter, drop, and RNG
-
         self.inbox.get_mut(&to).unwrap().push_back(Event::Msg(m.clone()));
-        let at = self.now + l.base_ms;
+        let at = self.now + base_ms;
         self.schedule(at, WheelEvent::Deliver(to));
+    }
+
+    fn get_link_with_node_id(&self, src: &NodeId, dst: &NodeId) -> Option<&Link> {
+        for ((a, b), l) in &self.links.0 {
+            match (a, b) {
+                (NodeKind::Replica(a), NodeKind::Replica(b)) if a == src && b == dst => return Some(l),
+                (NodeKind::Client(a), NodeKind::Replica(b)) if a == src && b == dst => return Some(l),
+                (NodeKind::Replica(a), NodeKind::Client(b)) if a == src && b == dst => return Some(l),
+                (NodeKind::Client(a), NodeKind::Client(b)) if a == src && b == dst => return Some(l),
+                _ => continue,
+            }
+        }
+        None
     }
 }

@@ -9,5 +9,5 @@ pub enum Effect<T: StateMachine> {
     SetTimer { kind: TimerKind, at: u64 },
     CancelTimer { kind: TimerKind },
     ApplyCommited { op_number: OpNumber },
-    Reply { request_id: usize, result: Option<T::Output> },
+    Reply { client_id: String, message: Message<T> },
 }

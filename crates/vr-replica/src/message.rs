@@ -21,6 +21,7 @@ pub enum Message<SM: StateMachine> {
     epoch: usize,
   },
   Reply {
+    client_id: String,
     view_number: ReplicaId,
     request_id: usize,
     result: Option<SM::Output>,

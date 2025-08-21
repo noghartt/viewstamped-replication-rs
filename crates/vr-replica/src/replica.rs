@@ -15,7 +15,7 @@ pub enum Status {
     Transitioning,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Replica<SM: StateMachine> {
     configuration: Vec<String>,
     pub replica_number: ReplicaId,
@@ -116,7 +116,14 @@ impl<SM: StateMachine> Replica<SM> {
             }
 
             if request.request_number == last_request.request_number {
-                return vec![Effect::Reply{ request_id: request.request_number, result: last_request.result }];
+                let reply = Message::Reply {
+                    client_id: request.client_id.clone(),
+                    view_number: self.view_number,
+                    request_id: request.request_number,
+                    result: last_request.result.clone(),
+                };
+
+                return vec![Effect::Reply { client_id: request.client_id.clone(), message: reply }];
             }
         };
 
@@ -217,10 +224,23 @@ impl<SM: StateMachine> Replica<SM> {
     // TODO: Validate if it needs to do more operations here
     fn commit_op(&mut self, op_number: OpNumber) -> Vec<Effect<SM>> {
         let (_op_number, request) = self.log.get(op_number - 1).unwrap();
-        self.state_machine.apply(request.op.clone());
+        let result = self.state_machine.apply(request.op.clone());
 
         let mut effects = vec![];
-        effects.push(Effect::Reply { request_id: request.request_number, result: request.result.clone() });
+
+        let mut request = request.clone();
+        request.result = Some(result.clone());
+
+        self.client_table.insert(request.client_id.clone(), request.clone());
+
+        let reply = Message::Reply {
+            client_id: request.client_id.clone(),
+            view_number: self.view_number,
+            request_id: request.request_number,
+            result: Some(result),
+        };
+
+        effects.push(Effect::Reply { client_id: request.client_id.clone(), message: reply });
 
         effects
     }
