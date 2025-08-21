@@ -4,5 +4,5 @@ pub trait StateMachine: Debug + Clone + 'static {
     type Input: Debug + Clone;
     type Output: Debug + Clone;
 
-    fn apply(&self, input: Self::Input) -> Self::Output;
+    fn apply(&mut self, input: Self::Input) -> Self::Output;
 }

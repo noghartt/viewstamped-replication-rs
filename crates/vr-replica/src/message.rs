@@ -9,6 +9,7 @@ pub struct ClientRequest<SM: StateMachine> {
     pub result: Option<SM::Output>,
 }
 
+#[derive(Clone, Debug)]
 pub enum Message<SM: StateMachine> {
   Error {
     message: String,

@@ -164,8 +164,8 @@ impl<SM: StateMachine> Replica<SM> {
         let prepare_ok = Message::PrepareOk {
             view_number: self.view_number,
             replica_number: self.replica_number,
-            op_number: self.op_number,
-            commit_number: self.commit_number,
+            op_number,
+            commit_number,
         };
 
         effects.push(Effect::Send { to: self.view_number, message: prepare_ok });
@@ -187,7 +187,7 @@ impl<SM: StateMachine> Replica<SM> {
             return vec![];
         }
 
-        self.op_ack_table.entry(op_number).or_insert(vec![]).push(view_number);
+        self.op_ack_table.entry(op_number).or_insert(vec![]).push(replica_number);
 
         let quorum = self.get_quorum();
         if self.op_ack_table.get(&op_number).unwrap_or(&vec![]).len() < quorum {
