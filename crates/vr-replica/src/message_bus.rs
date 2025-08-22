@@ -1,9 +1,9 @@
-use crate::{message::Message, state_machine::StateMachine, types::ReplicaId};
+use crate::{message::Message, types::ReplicaId};
 
-pub trait MessageBus<SM: StateMachine> {
-    fn send(&self, to: ReplicaId, message: Message<SM>);
+pub trait MessageBus<Input: Clone, Output: Clone> {
+    fn send(&self, to: ReplicaId, message: Message<Input, Output>);
 
-    fn broadcast(&self, to: Vec<ReplicaId>, message: Message<SM>) {
+    fn broadcast(&self, to: Vec<ReplicaId>, message: Message<Input, Output>) {
         for replica_id in to {
             self.send(replica_id, message.clone());
         }

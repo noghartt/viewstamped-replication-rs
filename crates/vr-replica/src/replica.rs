@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::rc::Rc;
 
 use crate::clock::TimerKind;
 use crate::effect::Effect;
@@ -16,7 +18,11 @@ pub enum Status {
 }
 
 #[derive(Debug, Clone)]
-pub struct Replica<SM: StateMachine> {
+pub struct Replica<Input, Output> 
+where 
+    Input: Clone + 'static,
+    Output: Clone + 'static,
+{
     configuration: Vec<String>,
     pub replica_number: ReplicaId,
 
@@ -26,12 +32,12 @@ pub struct Replica<SM: StateMachine> {
 
     pub op_number: usize,
     pub commit_number: usize,
-    log: Vec<(OpNumber, ClientRequest<SM>)>,
-    client_table: HashMap<String, ClientRequest<SM>>,
+    log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
+    client_table: HashMap<String, ClientRequest<Input, Output>>,
 
     pub op_ack_table: HashMap<OpNumber, Vec<ReplicaId>>,
 
-    state_machine: SM,
+    state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
 
     // Timers
     timeout_primary_idle_commit: u64,
@@ -40,11 +46,15 @@ pub struct Replica<SM: StateMachine> {
     next_backup_watchdog: Option<u64>,
 }
 
-impl<SM: StateMachine> Replica<SM> {
+impl<Input, Output> Replica<Input, Output>
+where 
+    Input: Clone,
+    Output: Clone,
+{
     pub fn new(
         configuration: Vec<String>,
         replica_number: ReplicaId,
-        state_machine: SM,
+        state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
     ) -> Self {
         let mut configuration = configuration.clone();
         configuration.sort();
@@ -67,7 +77,7 @@ impl<SM: StateMachine> Replica<SM> {
         }
     }
 
-    pub fn tick(&mut self, now: u64) -> Vec<Effect<SM>> {
+    pub fn tick(&mut self, now: u64) -> Vec<Effect<Input, Output>> {
         let mut effects = vec![];
         if self.is_primary() && self.status == Status::Normal {
             if self.next_primary_idle_commit.is_some_and(|t| now >= t) {
@@ -94,7 +104,7 @@ impl<SM: StateMachine> Replica<SM> {
         effects
     }
 
-    pub fn on_message(&mut self, message: Message<SM>, now: u64) -> Vec<Effect<SM>> {
+    pub fn on_message(&mut self, message: Message<Input, Output>, now: u64) -> Vec<Effect<Input, Output>> {
         match message {
             Message::Request { 0: request } => self.on_request(request, now),
             Message::Prepare { op: _, view_number, op_number, commit_number , request } =>
@@ -105,7 +115,7 @@ impl<SM: StateMachine> Replica<SM> {
         }
     }
 
-    fn on_request(&mut self, request: ClientRequest<SM>, now: u64) -> Vec<Effect<SM>> {
+    fn on_request(&mut self, request: ClientRequest<Input, Output>, now: u64) -> Vec<Effect<Input, Output>> {
         if !self.is_primary() {
             return vec![];
         }
@@ -150,12 +160,12 @@ impl<SM: StateMachine> Replica<SM> {
 
     fn on_prepare(
         &mut self,
-        request: Box<ClientRequest<SM>>,
+        request: Box<ClientRequest<Input, Output>>,
         view_number: ReplicaId,
         op_number: usize,
         commit_number: usize,
         now: u64
-    ) -> Vec<Effect<SM>> {
+    ) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) {
             return vec![];
         }
@@ -185,7 +195,7 @@ impl<SM: StateMachine> Replica<SM> {
         effects
     }
 
-    fn on_prepare_ok(&mut self, view_number: ReplicaId, replica_number: ReplicaId, op_number: usize, commit_number: usize) -> Vec<Effect<SM>> {
+    fn on_prepare_ok(&mut self, view_number: ReplicaId, replica_number: ReplicaId, op_number: usize, commit_number: usize) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) || !self.is_primary() {
             return vec![];
         }
@@ -213,7 +223,7 @@ impl<SM: StateMachine> Replica<SM> {
         self.view_number == view_number
     }
 
-    fn get_last_request_from_client(&self, client_id: String) -> Option<ClientRequest<SM>> {
+    fn get_last_request_from_client(&self, client_id: String) -> Option<ClientRequest<Input, Output>> {
         self.client_table.get(&client_id).cloned()
     }
 
@@ -222,9 +232,10 @@ impl<SM: StateMachine> Replica<SM> {
     }
 
     // TODO: Validate if it needs to do more operations here
-    fn commit_op(&mut self, op_number: OpNumber) -> Vec<Effect<SM>> {
+    fn commit_op(&mut self, op_number: OpNumber) -> Vec<Effect<Input, Output>> {
         let (_op_number, request) = self.log.get(op_number - 1).unwrap();
-        let result = self.state_machine.apply(request.op.clone());
+        let sm = self.state_machine.clone();
+        let result = sm.borrow_mut().apply(request.op.clone());
 
         let mut effects = vec![];
 

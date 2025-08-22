@@ -1,7 +1,7 @@
 use vr_replica::{clock::TimerKind, message::Message, state_machine::StateMachine};
 
-pub enum Event<SM: StateMachine> {
-    Msg(Message<SM>),        
+pub enum Event<Input: Clone, Output: Clone> {
+    Msg(Message<Input, Output>),        
     TimerFired(TimerKind),     
 }
 

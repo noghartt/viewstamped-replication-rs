@@ -1,20 +1,19 @@
-use crate::state_machine::StateMachine;
 use crate::types::ReplicaId;
 
 #[derive(Clone, Debug)]
-pub struct ClientRequest<SM: StateMachine> {
-    pub op: SM::Input,
+pub struct ClientRequest<I, O> {
+    pub op: I,
     pub client_id: String,
     pub request_number: usize,
-    pub result: Option<SM::Output>,
+    pub result: Option<O>,
 }
 
 #[derive(Clone, Debug)]
-pub enum Message<SM: StateMachine> {
+pub enum Message<I, O> {
   Error {
     message: String,
   },
-  Request(ClientRequest<SM>),
+  Request(ClientRequest<I, O>),
   Connect {
     configuration: Vec<String>,
     current_view: usize,
@@ -24,14 +23,14 @@ pub enum Message<SM: StateMachine> {
     client_id: String,
     view_number: ReplicaId,
     request_id: usize,
-    result: Option<SM::Output>,
+    result: Option<O>,
   },
   Prepare {
-    op: SM::Input,
+    op: I,
     view_number: ReplicaId,
     op_number: usize,
     commit_number: usize,
-    request: Box<ClientRequest<SM>>,
+    request: Box<ClientRequest<I, O>>,
   },
   PrepareOk {
     view_number: ReplicaId,

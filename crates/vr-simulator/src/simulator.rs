@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use vr_replica::{clock::TimerKind, effect::Effect, message::Message, replica::Replica, state_machine::StateMachine};
+use vr_replica::{clock::TimerKind, effect::Effect, message::Message, replica::Replica};
 
-use crate::{client::Client, events::Event};
+use crate::{client::{Client, Op}, events::Event};
 
 #[derive(Clone)]
 pub struct Links(pub HashMap<(NodeKind, NodeKind), Link>);
@@ -42,19 +42,23 @@ enum WheelEvent {
 }
 
 // TODO: Add RNG
-pub struct Simulator<SM: StateMachine> {
+pub struct Simulator<Input: Clone + 'static, Output: Clone + 'static> {
     pub now: u64,
     wheel: BTreeMap<u64, Vec<WheelEvent>>,
 
-    replicas: HashMap<NodeId, Replica<SM>>,
-    inbox: HashMap<NodeId, VecDeque<Event<SM>>>,
+    replicas: HashMap<NodeId, Replica<Input, Output>>,
+    inbox: HashMap<NodeId, VecDeque<Event<Input, Output>>>,
     links: Links,
 
-    clients: HashMap<NodeId, Client<SM::State>>,
-    client_inbox: HashMap<NodeId, VecDeque<SM::Input>>,
+    clients: HashMap<NodeId, Client>,
+    client_inbox: HashMap<NodeId, VecDeque<Op>>,
 }
 
-impl <SM: StateMachine> Simulator<SM> {
+impl <Input, Output> Simulator<Input, Output>
+where 
+    Input: Clone + 'static,
+    Output: Clone + 'static,
+{
     pub fn new() -> Self {
         Self {
             now: 0,
@@ -67,26 +71,26 @@ impl <SM: StateMachine> Simulator<SM> {
         }
     }
 
-    pub fn get_clients(&self) -> Vec<Client<SM::State>> {
+    pub fn get_clients(&self) -> Vec<Client> {
         self.clients.values().cloned().collect()
     }
 
-    pub fn get_replicas(&self) -> Vec<Replica<SM>> {
-        self.replicas.values().cloned().collect()
+    pub fn get_replicas(&self) -> Vec<&Replica<Input, Output>> {
+        self.replicas.values().map(|r| r).collect()
     }
 
     pub fn get_links(&self) -> Links {
         self.links.clone()
     }
 
-    pub fn add_replica(&mut self, id: NodeId, r: Replica<SM>) {
+    pub fn add_replica(&mut self, id: NodeId, r: Replica<Input, Output>) {
         self.replicas.insert(id, r);
         self.inbox.insert(id, VecDeque::new());
         self.schedule(self.now, WheelEvent::FireTimer { node: id, kind: TimerKind::PrimaryIdleCommit });
         self.schedule(self.now, WheelEvent::FireTimer { node: id, kind: TimerKind::BackupWatchdog });
     }
 
-    pub fn add_client(&mut self, id: NodeId, c: Client<SM::State>) {
+    pub fn add_client(&mut self, id: NodeId, c: Client) {
         self.clients.insert(id, c);
         self.client_inbox.insert(id, VecDeque::new());
     }
@@ -132,7 +136,7 @@ impl <SM: StateMachine> Simulator<SM> {
         self.schedule(self.now, WheelEvent::Deliver(node));
     }
 
-    fn apply_effects(&mut self, from: NodeId, effs: &mut Vec<Effect<SM>>) {
+    fn apply_effects(&mut self, from: NodeId, effs: &mut Vec<Effect<Input, Output>>) {
         for eff in effs.drain(..) {
             match eff {
                 Effect::Send { to, message } => self.send(from, NodeId(to), message),
@@ -141,7 +145,7 @@ impl <SM: StateMachine> Simulator<SM> {
         }
     }
 
-    fn send(&mut self, from: NodeId, to: NodeId, m: Message<SM>) {
+    fn send(&mut self, from: NodeId, to: NodeId, m: Message<Input, Output>) {
         let Some(l) = self.get_link_with_node_id(&from, &to) else {
             return;
         };
