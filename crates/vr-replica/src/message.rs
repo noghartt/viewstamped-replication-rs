@@ -3,7 +3,7 @@ use crate::types::ReplicaId;
 #[derive(Clone, Debug)]
 pub struct ClientRequest<I, O> {
     pub op: I,
-    pub client_id: String,
+    pub client_id: u64,
     pub request_number: usize,
     pub result: Option<O>,
 }
@@ -20,7 +20,7 @@ pub enum Message<I, O> {
     epoch: usize,
   },
   Reply {
-    client_id: String,
+    client_id: u64,
     view_number: ReplicaId,
     request_id: usize,
     result: Option<O>,

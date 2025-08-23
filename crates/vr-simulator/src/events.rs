@@ -1,10 +1,8 @@
-use vr_replica::{clock::TimerKind, message::Message, state_machine::StateMachine};
+use vr_replica::{clock::TimerKind, message::Message};
 
-pub enum Event<Input: Clone, Output: Clone> {
-    Msg(Message<Input, Output>),        
-    TimerFired(TimerKind),     
-}
+use crate::client::Op;
 
-pub enum ClientEvent<SM: StateMachine> {
-    Reply { client_id: String, request_id: u64, result: SM::Output },
+pub enum Event<Input: Clone> {
+    Msg(Message<Input, Op>),        
+    TimerFired(TimerKind),
 }

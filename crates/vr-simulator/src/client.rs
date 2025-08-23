@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use vr_replica::state_machine::StateMachine;
+use vr_replica::{message::Message, state_machine::StateMachine};
 
-use crate::simulator::NodeId;
+use crate::{events::Event, simulator::NodeId};
 
 #[derive(Debug, Clone)]
 pub enum Op {
     Set(String, u64),
-    Get(String),
+    Get(String, Option<u64>),
     Del(String),
 }
 
@@ -19,14 +19,11 @@ pub struct Client {
     /// A sorted array containing the IP addresses of the replicas in the system.
     pub configuration: Vec<String>,
     /// The current view number. The primary replica is the one with the index `current_view` in the `configuration` array.
-    pub current_view: usize,
+    pub current_view: u64,
     /// The current request number. For future requests, it should ensure to be greater than the previous request number.
     pub request_number: u64,
     /// The current epoch number of the replica group.
     pub epoch: usize,
-
-    // Test related fields
-    pub inflight_requests: Vec<Op>,
 }
 
 impl Client {
@@ -38,7 +35,32 @@ impl Client {
             current_view: 0, 
             request_number: 0, 
             epoch: 0, 
-            inflight_requests: vec![] 
+        }
+    }
+
+    pub fn on_message<I: Clone + 'static>(&mut self, ev: Event<I>) -> () {
+        match ev {
+            Event::Msg(m) if matches!(m, Message::Reply { .. }) => {
+                let Message::Reply { result, .. } = m else {
+                    panic!("Unexpected message");
+                };
+
+                // TODO: Not sure if we should update the request_number only on reply.
+                self.request_number += 1;
+                if let Some(op) = result {
+                    self.apply_op(op);
+                }
+            },
+            _ => panic!("Unexpected message"),
+        }
+    }
+
+    fn apply_op(&mut self, op: Op) -> () {
+        match op {
+            Op::Set(key, value) => {
+                self.state.insert(key, value);
+            },
+            _ => todo!()
         }
     }
 }

@@ -16,7 +16,7 @@ mod tests {
 
     #[test]
     fn test_setup_clients_and_replicas() {
-        let mut sim = Simulator::<Op, ()>::new();
+        let mut sim = Simulator::<Op>::new();
         setup_clients_and_replicas(&mut sim, 2, 3);
 
         let clients = sim.get_clients();
@@ -61,14 +61,14 @@ mod tests {
 
     #[test]
     fn test_connect_client_to_replica() {
-        let mut sim = Simulator::<Op, ()>::new();
+        let mut sim = Simulator::<Op>::new();
         setup_clients_and_replicas(&mut sim, 2, 3);
 
         let clients = sim.get_clients();
         let replicas = sim.get_replicas();
     }
 
-    fn setup_clients_and_replicas(sim: &mut Simulator<Op, ()>, client_count: u64, replica_count: u64) {
+    fn setup_clients_and_replicas(sim: &mut Simulator<Op>, client_count: u64, replica_count: u64) {
         let mut clients = Vec::new();
         for i in 0..client_count {
             let client = Client::new(NodeId(i));
@@ -102,12 +102,12 @@ mod tests {
         set_link_between_replicas(sim, replicas, link);
     }
 
-    fn setup_replica(id: u64, configuration: Vec<String>) -> Replica<Op, ()> {
+    fn setup_replica(id: u64, configuration: Vec<String>) -> Replica<Op, Op> {
         let state = Rc::new(RefCell::new(ReplicaState { state: HashMap::new() }));
         Replica::new(configuration, id, state)
     }
 
-    fn set_link_between_replicas(sim: &mut Simulator<Op, ()>, replicas: Vec<(NodeId, Replica<Op, ()>)>, link: Link) {
+    fn set_link_between_replicas(sim: &mut Simulator<Op>, replicas: Vec<(NodeId, Replica<Op, Op>)>, link: Link) {
         replicas.iter().for_each(|(node_id, _)| {
             let other_replicas = replicas.iter().filter(|(other_node_id, _)| other_node_id != node_id);
             other_replicas.for_each(|(other_node_id, _)| {
@@ -123,19 +123,21 @@ mod tests {
 
     impl StateMachine for ReplicaState {
         type Input = Op;
-        type Output = ();
+        type Output = Op;
 
         fn apply(&mut self, input: Self::Input) -> Self::Output {
             match input {
                 Op::Set(key, value) => {
-                    self.state.insert(key, value);
+                    self.state.insert(key.clone(), value);
+                    Op::Set(key, value)
                 }
-                Op::Get(key) => {
-                    self.state.get(&key).cloned();
-                    todo!()
+                Op::Get(key, _) => {
+                    let value = self.state.get(&key).cloned();
+                    Op::Get(key, value)
                 }
                 Op::Del(key) => {
                     self.state.remove(&key);
+                    Op::Del(key)
                 }
             }
         }

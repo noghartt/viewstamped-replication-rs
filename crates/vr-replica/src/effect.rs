@@ -8,5 +8,5 @@ pub enum Effect<I, O> {
     SetTimer { kind: TimerKind, at: u64 },
     CancelTimer { kind: TimerKind },
     ApplyCommited { op_number: OpNumber },
-    Reply { client_id: String, message: Message<I, O> },
+    Reply { client_id: u64, message: Message<I, O> },
 }

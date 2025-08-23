@@ -33,7 +33,7 @@ where
     pub op_number: usize,
     pub commit_number: usize,
     log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
-    client_table: HashMap<String, ClientRequest<Input, Output>>,
+    client_table: HashMap<u64, ClientRequest<Input, Output>>,
 
     pub op_ack_table: HashMap<OpNumber, Vec<ReplicaId>>,
 
@@ -223,7 +223,7 @@ where
         self.view_number == view_number
     }
 
-    fn get_last_request_from_client(&self, client_id: String) -> Option<ClientRequest<Input, Output>> {
+    fn get_last_request_from_client(&self, client_id: u64) -> Option<ClientRequest<Input, Output>> {
         self.client_table.get(&client_id).cloned()
     }
 
