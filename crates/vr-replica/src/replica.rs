@@ -20,10 +20,10 @@ pub enum Status {
 #[derive(Debug, Clone)]
 pub struct Replica<Input, Output> 
 where 
-    Input: Clone + 'static,
-    Output: Clone + 'static,
+    Input: Clone + std::fmt::Debug + 'static,
+    Output: Clone + std::fmt::Debug + 'static,
 {
-    configuration: Vec<String>,
+    configuration: Vec<ReplicaId>,
     pub replica_number: ReplicaId,
 
     pub epoch: u64,
@@ -32,12 +32,12 @@ where
 
     pub op_number: usize,
     pub commit_number: usize,
-    log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
+    pub log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
     client_table: HashMap<u64, ClientRequest<Input, Output>>,
 
     pub op_ack_table: HashMap<OpNumber, Vec<ReplicaId>>,
 
-    state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
+    pub state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
 
     // Timers
     timeout_primary_idle_commit: u64,
@@ -48,11 +48,11 @@ where
 
 impl<Input, Output> Replica<Input, Output>
 where 
-    Input: Clone,
-    Output: Clone,
+    Input: Clone + std::fmt::Debug,
+    Output: Clone + std::fmt::Debug,
 {
     pub fn new(
-        configuration: Vec<String>,
+        configuration: Vec<ReplicaId>,
         replica_number: ReplicaId,
         state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
     ) -> Self {
@@ -97,7 +97,7 @@ where
         if !self.is_primary() && self.status == Status::Normal {
             if self.next_backup_watchdog.is_some_and(|t| now >= t) {
                 // TODO: Implement View Change Protocol here
-                todo!()
+                println!("TODO: Implement View Change Protocol here");
             }
         }
 
@@ -111,7 +111,11 @@ where
                 self.on_prepare(request, view_number, op_number, commit_number, now),
             Message::PrepareOk { view_number, replica_number, op_number, commit_number } =>
                 self.on_prepare_ok(view_number, replica_number, op_number, commit_number),
-            _ => todo!() 
+            Message::Commit { op_number, commit_number, view_number } => {
+                self.on_commit(op_number, commit_number, view_number);
+                vec![]
+            }
+            m => panic!("unexpected message: {:?}", m)
         }
     }
 
@@ -138,6 +142,9 @@ where
         };
 
         self.op_number += 1;
+        if self.log.len() + 1 == self.op_number {
+            self.log.push((self.op_number, request.clone()));
+        }
 
         let mut effects = vec![];
 
@@ -173,6 +180,7 @@ where
         let mut effects = vec![];
 
         if self.log.len() + 1 == op_number {
+            println!("pushing op_number: {:?}, replica_number: {:?}, request: {:?}", op_number, self.replica_number, request);
             self.log.push((op_number, *request));
         }
 
@@ -211,7 +219,31 @@ where
             return vec![];
         }
 
-        self.commit_op(op_number)
+        let mut effects = vec![];
+        let (result, request) = self.commit_op(op_number);
+
+        let reply = Message::Reply {
+            client_id: request.client_id.clone(),
+            view_number: self.view_number,
+            request_id: request.request_number,
+            result: Some(result),
+        };
+
+        effects.push(Effect::Reply { client_id: request.client_id.clone(), message: reply });
+
+        effects
+    }
+
+    fn on_commit(&mut self, op_number: OpNumber, commit_number: usize, view_number: ReplicaId) {
+        if !self.is_same_view(view_number) || self.is_primary() {
+            return;
+        }
+
+        if op_number == self.op_number {
+            return;
+        }
+
+        let _ = self.commit_op(op_number);
     }
 
     #[inline]
@@ -232,27 +264,18 @@ where
     }
 
     // TODO: Validate if it needs to do more operations here
-    fn commit_op(&mut self, op_number: OpNumber) -> Vec<Effect<Input, Output>> {
-        let (_op_number, request) = self.log.get(op_number - 1).unwrap();
+    pub fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
+        // TODO: Validate how exactly we should retrieve the op_number to be committed.
+        // From the original implementation, seems that it does op_number - 1. Why? Not sure yet.
+        println!("committing op_number: {:?}, log: {:?}, replica_number: {:?}", op_number, self.log, self.replica_number);
+        let op_number = if op_number == 0 { 0 } else { op_number - 1 };
+        println!("op_number: {:?}", op_number);
+        let (_op_number, request) = self.log.get(op_number).unwrap();
         let sm = self.state_machine.clone();
         let result = sm.borrow_mut().apply(request.op.clone());
-
-        let mut effects = vec![];
-
         let mut request = request.clone();
         request.result = Some(result.clone());
-
         self.client_table.insert(request.client_id.clone(), request.clone());
-
-        let reply = Message::Reply {
-            client_id: request.client_id.clone(),
-            view_number: self.view_number,
-            request_id: request.request_number,
-            result: Some(result),
-        };
-
-        effects.push(Effect::Reply { client_id: request.client_id.clone(), message: reply });
-
-        effects
+        (result, request)
     }
 }

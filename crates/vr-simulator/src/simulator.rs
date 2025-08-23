@@ -43,8 +43,23 @@ enum WheelEvent<Input> {
     ClientThink { client_id: NodeId, op: Input },
 }
 
+#[derive(Debug)]
+pub struct SimulatorConfig {
+    pub disable_timers: bool,
+    pub run_until_max_time: Option<u64>,
+}
+
+impl Default for SimulatorConfig {
+    fn default() -> Self {
+        Self {
+            disable_timers: false,
+            run_until_max_time: None,
+        }
+    }
+}
+
 // TODO: Add RNG
-pub struct Simulator<Input: Clone + 'static> {
+pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     pub now: u64,
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
 
@@ -53,10 +68,12 @@ pub struct Simulator<Input: Clone + 'static> {
     links: Links,
 
     clients: HashMap<NodeId, Client>,
+
+    config: SimulatorConfig,
 }
 
-impl <Input: Clone + 'static> Simulator<Input> {
-    pub fn new() -> Self {
+impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
+    pub fn new(config: Option<SimulatorConfig>) -> Self {
         Self {
             now: 0,
             wheel: BTreeMap::new(),
@@ -64,6 +81,7 @@ impl <Input: Clone + 'static> Simulator<Input> {
             inbox: HashMap::new(),
             links: Links(HashMap::new()),
             clients: HashMap::new(),
+            config: config.unwrap_or_default(),
         }
     }
 
@@ -90,10 +108,21 @@ impl <Input: Clone + 'static> Simulator<Input> {
     }
 
     pub fn add_replica(&mut self, id: NodeId, r: Replica<Input, Op>) {
+        // Only schedule timers based on replica role, and not immediately at time 0
+        let is_primary = r.view_number == r.replica_number;
+        
         self.replicas.insert(id, r);
         self.inbox.insert(NodeKind::Replica(id), VecDeque::new());
-        self.schedule(self.now, WheelEvent::FireTimer { node: id, kind: TimerKind::PrimaryIdleCommit });
-        self.schedule(self.now, WheelEvent::FireTimer { node: id, kind: TimerKind::BackupWatchdog });
+
+        // Schedule initial timers with some delay to avoid immediate firing
+        if !self.config.disable_timers {
+            let initial_delay = 100;
+            if is_primary {
+                self.schedule(self.now + initial_delay, WheelEvent::FireTimer { node: id, kind: TimerKind::PrimaryIdleCommit });
+            } else {
+                self.schedule(self.now + initial_delay, WheelEvent::FireTimer { node: id, kind: TimerKind::BackupWatchdog });
+            }
+        }
     }
 
     pub fn add_client(&mut self, id: NodeId, c: Client) {
@@ -107,7 +136,9 @@ impl <Input: Clone + 'static> Simulator<Input> {
     }
 
     pub fn step(&mut self) {
+        println!("stepping");
         let Some((&at, evs)) = self.wheel.iter().next() else {
+            println!("no events to step");
             return;
         };
 
@@ -124,12 +155,20 @@ impl <Input: Clone + 'static> Simulator<Input> {
     }
 
     pub fn run(&mut self) {
-        while let Some((&_, _)) = self.wheel.iter().next() {
-            self.step()
-        }
+        self.run_until(self.config.run_until_max_time.unwrap_or(u64::MAX))
     }
 
-    fn do_step(&mut self, at: u64) {
+    pub fn run_until(&mut self, max_time: u64) {
+        println!("running until time {}", max_time);
+        while let Some((&at, _)) = self.wheel.iter().next() {
+            if at > max_time {
+                println!("reached max simulation time: {}", max_time);
+                break;
+            }
+            println!("stepping at time {}", at);
+            self.step()
+        }
+        println!("simulation finished at time {}", self.now);
     }
 
     fn schedule(&mut self, at: u64, event: WheelEvent<Input>) {
@@ -182,8 +221,9 @@ impl <Input: Clone + 'static> Simulator<Input> {
             request_number: 0,
             result: None,
         });
-        
-        let replica_id = NodeId(client.current_view);
+
+        let current_primary = client.configuration[client.current_view as usize];
+        let replica_id = NodeId(current_primary);
         self.send(NodeKind::Client(client_id), NodeKind::Replica(replica_id), request);
     }
 
@@ -194,12 +234,29 @@ impl <Input: Clone + 'static> Simulator<Input> {
                     let from_replica = NodeKind::Replica(from);
                     let to_replica = NodeKind::Replica(NodeId(to));
                     self.send(from_replica, to_replica, message);
-                },
+                }
                 Effect::Reply { client_id, message } => {
                     assert!(matches!(message, Message::Reply { .. }));
                     self.send(NodeKind::Replica(from), NodeKind::Client(NodeId(client_id)), message);
-                },
-                _ => todo!()
+                }
+                Effect::Broadcast { to, message } => {
+                    for replica_id in to {
+                        let replica_id = NodeId(replica_id);
+                        self.send(NodeKind::Replica(from), NodeKind::Replica(replica_id), message.clone());
+                    }
+                }
+                Effect::SetTimer { kind, at } => {
+                    if !self.config.disable_timers {
+                        println!("setting timer: {:?}, {:?}", from, kind);
+                        self.schedule(at, WheelEvent::FireTimer { node: from, kind });
+                    }
+                }
+                // Apply/commit prepared operation in backups in the moment it will be responded as PrepareOk to the primary replica.
+                Effect::ApplyCommited { op_number } => {
+                    let r = self.replicas.get(&from).unwrap();
+                    r.clone().commit_op(op_number);
+                }
+                e => todo!("{:?}", e)
             }
         }
     }
@@ -217,6 +274,7 @@ impl <Input: Clone + 'static> Simulator<Input> {
         // TODO: Add jitter, drop, and RNG
         self.inbox.get_mut(&to).unwrap().push_back(Event::Msg(m.clone()));
         let at = self.now + base_ms;
+        println!("sending message: {:?}, {:?} -> {:?}, at: {:?}", m, from, to, at);
         self.schedule(at, WheelEvent::Deliver(to));
     }
 }

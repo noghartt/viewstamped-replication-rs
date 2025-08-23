@@ -17,7 +17,7 @@ pub struct Client {
     pub state: HashMap<String, u64>,
 
     /// A sorted array containing the IP addresses of the replicas in the system.
-    pub configuration: Vec<String>,
+    pub configuration: Vec<u64>,
     /// The current view number. The primary replica is the one with the index `current_view` in the `configuration` array.
     pub current_view: u64,
     /// The current request number. For future requests, it should ensure to be greater than the previous request number.
@@ -27,11 +27,11 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(id: NodeId) -> Self {
+    pub fn new(id: NodeId, configuration: Vec<u64>) -> Self {
         Self { 
             id, 
             state: HashMap::new(), 
-            configuration: vec![], 
+            configuration, 
             current_view: 0, 
             request_number: 0, 
             epoch: 0, 

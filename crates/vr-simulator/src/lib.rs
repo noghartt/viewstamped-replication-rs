@@ -12,11 +12,11 @@ mod tests {
     use vr_replica::state_machine::StateMachine;
 
     use crate::client::{Client, Op};
-    use crate::simulator::{Link, NodeId, NodeKind, Simulator};
+    use crate::simulator::{Link, NodeId, NodeKind, Simulator, SimulatorConfig};
 
     #[test]
     fn test_setup_clients_and_replicas() {
-        let mut sim = Simulator::<Op>::new();
+        let mut sim = Simulator::<Op>::new(None);
         setup_clients_and_replicas(&mut sim, 2, 3);
 
         let clients = sim.get_clients();
@@ -61,28 +61,37 @@ mod tests {
 
     #[test]
     fn test_connect_client_to_replica() {
-        let mut sim = Simulator::<Op>::new();
+        let config = SimulatorConfig {
+            disable_timers: true,
+            ..Default::default()
+        };
+
+        let mut sim = Simulator::<Op>::new(Some(config));
         setup_clients_and_replicas(&mut sim, 2, 3);
 
         let clients = sim.get_clients();
-        let replicas = sim.get_replicas();
+
+        sim.start_client_request(clients[0].id, Op::Set("a".to_string(), 1));
+        sim.run();
+
+        println!("finished")
     }
 
     fn setup_clients_and_replicas(sim: &mut Simulator<Op>, client_count: u64, replica_count: u64) {
-        let mut clients = Vec::new();
-        for i in 0..client_count {
-            let client = Client::new(NodeId(i));
-            clients.push(client.clone());
-            sim.add_client(NodeId(i), client);
-        }
-
-        let configuration = (0..replica_count).map(|i| format!("{}", i)).collect::<Vec<_>>();
+        let configuration = (0..replica_count).map(|i| i).collect::<Vec<_>>();
         let mut replicas = Vec::new();
         for i in 0..replica_count {
             let replica = setup_replica(i, configuration.clone());
             let node_id = NodeId(i);
             replicas.push((node_id.clone(), replica.clone()));
             sim.add_replica(node_id, replica);
+        }
+
+        let mut clients = Vec::new();
+        for i in 0..client_count {
+            let client = Client::new(NodeId(i), configuration.clone());
+            clients.push(client.clone());
+            sim.add_client(NodeId(i), client);
         }
 
         let link = Link {
@@ -102,7 +111,7 @@ mod tests {
         set_link_between_replicas(sim, replicas, link);
     }
 
-    fn setup_replica(id: u64, configuration: Vec<String>) -> Replica<Op, Op> {
+    fn setup_replica(id: u64, configuration: Vec<u64>) -> Replica<Op, Op> {
         let state = Rc::new(RefCell::new(ReplicaState { state: HashMap::new() }));
         Replica::new(configuration, id, state)
     }
