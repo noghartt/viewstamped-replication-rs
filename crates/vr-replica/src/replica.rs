@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::clock::TimerKind;
 use crate::effect::Effect;
 use crate::message::{ClientRequest, Message};
 use crate::state_machine::StateMachine;
@@ -39,12 +38,6 @@ where
     pub op_ack_table: HashMap<OpNumber, Vec<ReplicaId>>,
 
     pub state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
-
-    // Timers
-    timeout_primary_idle_commit: u64,
-    next_primary_idle_commit: Option<u64>,
-    timeout_backup_watchdog: u64,
-    next_backup_watchdog: Option<u64>,
 }
 
 impl<Input, Output> Replica<Input, Output>
@@ -72,35 +65,10 @@ where
             log: Vec::new(),
             client_table: HashMap::new(),
             op_ack_table: HashMap::new(),
-            timeout_primary_idle_commit: 1000,
-            next_primary_idle_commit: None,
-            timeout_backup_watchdog: 5000,
-            next_backup_watchdog: None,
         }
     }
 
-    pub fn tick(&mut self, now: u64) -> Vec<Effect<Input, Output>> {
-        let mut effects = vec![];
-        if self.is_primary() && self.status == Status::Normal {
-            // TODO: Implement here too
-            todo!("TODO: Implement here what is missing lol")
-        }
-
-        if !self.is_primary() && self.status == Status::Normal {
-            if self.next_backup_watchdog.is_some_and(|t| now >= t) {
-                // TODO: Implement View Change Protocol here
-                todo!("TODO: Implement View Change Protocol here");
-            }
-        }
-
-        effects
-    }
-
-    pub fn on_message(
-        &mut self,
-        message: Message<Input, Output>,
-        now: u64,
-    ) -> Vec<Effect<Input, Output>> {
+    pub fn on_message(&mut self, message: Message<Input, Output>) -> Vec<Effect<Input, Output>> {
         match message {
             Message::Request { 0: request } => self.on_request(request),
             Message::Prepare {
@@ -109,7 +77,7 @@ where
                 op_number,
                 commit_number,
                 request,
-            } => self.on_prepare(request, view_number, op_number, commit_number, now),
+            } => self.on_prepare(request, view_number, op_number, commit_number),
             Message::PrepareOk {
                 view_number,
                 replica_number,
@@ -188,7 +156,6 @@ where
         view_number: ReplicaId,
         op_number: usize,
         commit_number: usize,
-        now: u64,
     ) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) {
             return vec![];
@@ -216,16 +183,6 @@ where
         effects.push(Effect::Send {
             to: self.view_number,
             message: prepare_ok,
-        });
-
-        let at = now + self.timeout_backup_watchdog;
-        self.next_backup_watchdog = Some(at);
-        effects.push(Effect::SetTimer {
-            kind: TimerKind::BackupWatchdog,
-            at,
-        });
-        effects.push(Effect::ApplyCommited {
-            op_number: self.op_number,
         });
 
         effects

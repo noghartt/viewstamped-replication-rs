@@ -1,4 +1,3 @@
-use crate::clock::TimerKind;
 use crate::message::Message;
 use crate::types::{OpNumber, ReplicaId};
 
@@ -6,13 +5,6 @@ pub enum Effect<I, O> {
     Send {
         to: ReplicaId,
         message: Message<I, O>,
-    },
-    SetTimer {
-        kind: TimerKind,
-        at: u64,
-    },
-    CancelTimer {
-        kind: TimerKind,
     },
     ApplyCommited {
         op_number: OpNumber,
@@ -33,10 +25,6 @@ where
             Effect::Send { to, message } => {
                 write!(f, "Send {{ to: {:?}, message: {:?} }}", to, message)
             }
-            Effect::SetTimer { kind, at } => {
-                write!(f, "SetTimer {{ kind: {:?}, at: {:?} }}", kind, at)
-            }
-            Effect::CancelTimer { kind } => write!(f, "CancelTimer {{ kind: {:?} }}", kind),
             Effect::ApplyCommited { op_number } => {
                 write!(f, "ApplyCommited {{ op_number: {:?} }}", op_number)
             }

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use tracing::{debug, error, info};
+use tracing::debug;
 
 use vr_replica::message::ClientRequest;
-use vr_replica::{clock::TimerKind, effect::Effect, message::Message, replica::Replica};
+use vr_replica::{effect::Effect, message::Message, replica::Replica};
 
 use crate::client::{Client, Op};
 use crate::events::Event;
@@ -41,7 +41,6 @@ pub struct Link {
 #[derive(Debug)]
 enum WheelEvent<Input> {
     Deliver(NodeKind),
-    FireTimer { node: NodeId, kind: TimerKind },
     ClientThink { client_id: NodeId, op: Input },
 }
 
@@ -132,24 +131,25 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
 
         // Schedule initial timers with some delay to avoid immediate firing
         if !self.config.disable_timers {
-            let initial_delay = 100;
-            if is_primary {
-                self.schedule(
-                    self.now + initial_delay,
-                    WheelEvent::FireTimer {
-                        node: id,
-                        kind: TimerKind::PrimaryIdleCommit,
-                    },
-                );
-            } else {
-                self.schedule(
-                    self.now + initial_delay,
-                    WheelEvent::FireTimer {
-                        node: id,
-                        kind: TimerKind::BackupWatchdog,
-                    },
-                );
-            }
+            // let initial_delay = 100;
+            // if is_primary {
+            //     self.schedule(
+            //         self.now + initial_delay,
+            //         WheelEvent::FireTimer {
+            //             node: id,
+            //             kind: TimerKind::PrimaryIdleCommit,
+            //         },
+            //     );
+            // } else {
+            //     self.schedule(
+            //         self.now + initial_delay,
+            //         WheelEvent::FireTimer {
+            //             node: id,
+            //             kind: TimerKind::BackupWatchdog,
+            //         },
+            //     );
+            // }
+            todo!("Implement the disable timers configuration");
         }
     }
 
@@ -164,7 +164,7 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     }
 
     pub fn step(&mut self) {
-        let Some((&at, evs)) = self.wheel.iter().next() else {
+        let Some((&at, _)) = self.wheel.iter().next() else {
             return;
         };
 
@@ -176,9 +176,6 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
         for ev in evs {
             match ev {
                 WheelEvent::Deliver(to) => self.deliver_one(to),
-                WheelEvent::FireTimer { node, kind } => {
-                    self.fire_timer(NodeKind::Replica(node), kind)
-                }
                 WheelEvent::ClientThink { client_id, op } => self.client_think(client_id, op),
             }
         }
@@ -201,8 +198,7 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                 debug!(event = ?ev, destination = ?dst, "deliver to replica");
                 let r = self.replicas.get_mut(&dst).unwrap();
                 let mut effs = match ev {
-                    Event::Msg(m) => r.on_message(m.clone(), self.now),
-                    Event::TimerFired(_) => r.tick(self.now),
+                    Event::Msg(m) => r.on_message(m.clone()),
                 };
                 debug!(destination = ?dst, effects = ?effs, "received effects from replicas");
                 self.apply_effects(dst, &mut effs);
@@ -217,15 +213,6 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                 c.on_message(ev);
             }
         }
-    }
-
-    fn fire_timer(&mut self, node: NodeKind, kind: TimerKind) {
-        // feed a timer-firing via the inbox so Replica::tick runs
-        self.inbox
-            .get_mut(&node)
-            .unwrap()
-            .push_back(Event::TimerFired(kind));
-        self.schedule(self.now, WheelEvent::Deliver(node));
     }
 
     fn client_think(&mut self, client_id: NodeId, op: Input) {
@@ -267,12 +254,6 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                         NodeKind::Client(NodeId(client_id)),
                         message,
                     );
-                }
-                Effect::SetTimer { kind, at } => {
-                    if !self.config.disable_timers {
-                        println!("setting timer: {:?}, {:?}", from, kind);
-                        self.schedule(at, WheelEvent::FireTimer { node: from, kind });
-                    }
                 }
                 // Apply/commit prepared operation in backups in the moment it will be responded as PrepareOk to the primary replica.
                 Effect::ApplyCommited { op_number } => {
