@@ -1,6 +1,8 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
+mod client;
 mod events;
 mod simulator;
-mod client;
 
 #[cfg(test)]
 mod tests {
@@ -28,12 +30,16 @@ mod tests {
 
         let mut client_links = 0;
         for client in clients {
-            let link_from_client = links.0.get(&(NodeKind::Client(client.id), NodeKind::Replica(NodeId(0))));
+            let link_from_client = links
+                .0
+                .get(&(NodeKind::Client(client.id), NodeKind::Replica(NodeId(0))));
             if link_from_client.is_some() {
                 client_links += 1;
             }
 
-            let link_to_client = links.0.get(&(NodeKind::Replica(NodeId(0)), NodeKind::Client(client.id)));
+            let link_to_client = links
+                .0
+                .get(&(NodeKind::Replica(NodeId(0)), NodeKind::Client(client.id)));
             if link_to_client.is_some() {
                 client_links += 1;
             }
@@ -42,13 +48,31 @@ mod tests {
         let mut replica_links = 0;
         for replica in replicas.clone() {
             let node_id = NodeId(replica.replica_number);
-            let other_replicas = replicas.iter().filter(|r| r.replica_number != replica.replica_number);
-            let has_link_to_other_replicas = other_replicas.clone().all(|r| links.0.get(&(NodeKind::Replica(node_id), NodeKind::Replica(NodeId(r.replica_number)))).is_some());
+            let other_replicas = replicas
+                .iter()
+                .filter(|r| r.replica_number != replica.replica_number);
+            let has_link_to_other_replicas = other_replicas.clone().all(|r| {
+                links
+                    .0
+                    .get(&(
+                        NodeKind::Replica(node_id),
+                        NodeKind::Replica(NodeId(r.replica_number)),
+                    ))
+                    .is_some()
+            });
             if has_link_to_other_replicas {
                 replica_links += 1;
             }
 
-            let has_link_from_other_replicas = other_replicas.clone().all(|r| links.0.get(&(NodeKind::Replica(NodeId(r.replica_number)), NodeKind::Replica(node_id))).is_some());
+            let has_link_from_other_replicas = other_replicas.clone().all(|r| {
+                links
+                    .0
+                    .get(&(
+                        NodeKind::Replica(NodeId(r.replica_number)),
+                        NodeKind::Replica(node_id),
+                    ))
+                    .is_some()
+            });
             if has_link_from_other_replicas {
                 replica_links += 1;
             }
@@ -78,6 +102,11 @@ mod tests {
     }
 
     fn setup_clients_and_replicas(sim: &mut Simulator<Op>, client_count: u64, replica_count: u64) {
+        tracing_subscriber::fmt()
+            .with_max_level(get_log_level())
+            // .json()
+            .init();
+
         let configuration = (0..replica_count).map(|i| i).collect::<Vec<_>>();
         let mut replicas = Vec::new();
         for i in 0..replica_count {
@@ -104,23 +133,39 @@ mod tests {
 
         for i in 0..client_count as usize {
             let client = clients[i].clone();
-            let (node_id, _)= replicas.get(0).unwrap();
-            sim.set_link(NodeKind::Client(client.id), NodeKind::Replica(node_id.clone()), link.clone());
+            let (node_id, _) = replicas.get(0).unwrap();
+            sim.set_link(
+                NodeKind::Client(client.id),
+                NodeKind::Replica(node_id.clone()),
+                link.clone(),
+            );
         }
 
         set_link_between_replicas(sim, replicas, link);
     }
 
     fn setup_replica(id: u64, configuration: Vec<u64>) -> Replica<Op, Op> {
-        let state = Rc::new(RefCell::new(ReplicaState { state: HashMap::new() }));
+        let state = Rc::new(RefCell::new(ReplicaState {
+            state: HashMap::new(),
+        }));
         Replica::new(configuration, id, state)
     }
 
-    fn set_link_between_replicas(sim: &mut Simulator<Op>, replicas: Vec<(NodeId, Replica<Op, Op>)>, link: Link) {
+    fn set_link_between_replicas(
+        sim: &mut Simulator<Op>,
+        replicas: Vec<(NodeId, Replica<Op, Op>)>,
+        link: Link,
+    ) {
         replicas.iter().for_each(|(node_id, _)| {
-            let other_replicas = replicas.iter().filter(|(other_node_id, _)| other_node_id != node_id);
+            let other_replicas = replicas
+                .iter()
+                .filter(|(other_node_id, _)| other_node_id != node_id);
             other_replicas.for_each(|(other_node_id, _)| {
-                sim.set_link(NodeKind::Replica(node_id.clone()), NodeKind::Replica(other_node_id.clone()), link.clone());
+                sim.set_link(
+                    NodeKind::Replica(node_id.clone()),
+                    NodeKind::Replica(other_node_id.clone()),
+                    link.clone(),
+                );
             });
         });
     }
@@ -149,6 +194,20 @@ mod tests {
                     Op::Del(key)
                 }
             }
+        }
+    }
+
+    fn get_log_level() -> tracing::Level {
+        let Ok(log_env) = std::env::var("LOG_LEVEL") else {
+            return tracing::Level::INFO;
+        };
+
+        match log_env.as_str() {
+            "debug" => tracing::Level::DEBUG,
+            "error" => tracing::Level::ERROR,
+            "warn" => tracing::Level::WARN,
+            "trace" => tracing::Level::TRACE,
+            _ => tracing::Level::INFO,
         }
     }
 }

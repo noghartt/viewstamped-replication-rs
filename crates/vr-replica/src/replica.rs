@@ -8,6 +8,7 @@ use crate::effect::Effect;
 use crate::message::{ClientRequest, Message};
 use crate::state_machine::StateMachine;
 use crate::types::{OpNumber, ReplicaId};
+use tracing::debug;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -18,8 +19,8 @@ pub enum Status {
 }
 
 #[derive(Debug, Clone)]
-pub struct Replica<Input, Output> 
-where 
+pub struct Replica<Input, Output>
+where
     Input: Clone + std::fmt::Debug + 'static,
     Output: Clone + std::fmt::Debug + 'static,
 {
@@ -47,7 +48,7 @@ where
 }
 
 impl<Input, Output> Replica<Input, Output>
-where 
+where
     Input: Clone + std::fmt::Debug,
     Output: Clone + std::fmt::Debug,
 {
@@ -56,6 +57,7 @@ where
         replica_number: ReplicaId,
         state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
     ) -> Self {
+        debug!(replica_number, "creating new replica");
         let mut configuration = configuration.clone();
         configuration.sort();
         Replica {
@@ -80,64 +82,74 @@ where
     pub fn tick(&mut self, now: u64) -> Vec<Effect<Input, Output>> {
         let mut effects = vec![];
         if self.is_primary() && self.status == Status::Normal {
-            if self.next_primary_idle_commit.is_some_and(|t| now >= t) {
-                let commit = Message::Commit {
-                    op_number: self.op_number,
-                    commit_number: self.commit_number,
-                    view_number: self.view_number,
-                };
-
-                effects.push(Effect::Broadcast { to: self.configuration.clone(), message: commit });
-                let at = now + self.timeout_primary_idle_commit;
-                self.next_primary_idle_commit = Some(at);
-                effects.push(Effect::SetTimer { kind: TimerKind::PrimaryIdleCommit, at });
-            }
+            // TODO: Implement here too
+            todo!("TODO: Implement here what is missing lol")
         }
 
         if !self.is_primary() && self.status == Status::Normal {
             if self.next_backup_watchdog.is_some_and(|t| now >= t) {
                 // TODO: Implement View Change Protocol here
-                println!("TODO: Implement View Change Protocol here");
+                todo!("TODO: Implement View Change Protocol here");
             }
         }
 
         effects
     }
 
-    pub fn on_message(&mut self, message: Message<Input, Output>, now: u64) -> Vec<Effect<Input, Output>> {
+    pub fn on_message(
+        &mut self,
+        message: Message<Input, Output>,
+        now: u64,
+    ) -> Vec<Effect<Input, Output>> {
         match message {
-            Message::Request { 0: request } => self.on_request(request, now),
-            Message::Prepare { op: _, view_number, op_number, commit_number , request } =>
-                self.on_prepare(request, view_number, op_number, commit_number, now),
-            Message::PrepareOk { view_number, replica_number, op_number, commit_number } =>
-                self.on_prepare_ok(view_number, replica_number, op_number, commit_number),
-            Message::Commit { op_number, commit_number, view_number } => {
+            Message::Request { 0: request } => self.on_request(request),
+            Message::Prepare {
+                op: _,
+                view_number,
+                op_number,
+                commit_number,
+                request,
+            } => self.on_prepare(request, view_number, op_number, commit_number, now),
+            Message::PrepareOk {
+                view_number,
+                replica_number,
+                op_number,
+                commit_number,
+            } => self.on_prepare_ok(view_number, replica_number, op_number, commit_number),
+            Message::Commit {
+                op_number,
+                commit_number,
+                view_number,
+            } => {
                 self.on_commit(op_number, commit_number, view_number);
                 vec![]
             }
-            m => panic!("unexpected message: {:?}", m)
+            m => panic!("unexpected message: {:?}", m),
         }
     }
 
-    fn on_request(&mut self, request: ClientRequest<Input, Output>, now: u64) -> Vec<Effect<Input, Output>> {
+    fn on_request(&mut self, request: ClientRequest<Input, Output>) -> Vec<Effect<Input, Output>> {
         if !self.is_primary() {
             return vec![];
         }
 
-        if let Some(last_request) = self.get_last_request_from_client(request.client_id.clone()) {
+        if let Some(last_request) = self.get_last_request_from_client(request.client_id) {
             if request.request_number < last_request.request_number {
                 return vec![];
             }
 
             if request.request_number == last_request.request_number {
                 let reply = Message::Reply {
-                    client_id: request.client_id.clone(),
+                    client_id: request.client_id,
                     view_number: self.view_number,
                     request_id: request.request_number,
                     result: last_request.result.clone(),
                 };
 
-                return vec![Effect::Reply { client_id: request.client_id.clone(), message: reply }];
+                return vec![Effect::Reply {
+                    client_id: request.client_id,
+                    message: reply,
+                }];
             }
         };
 
@@ -145,8 +157,6 @@ where
         if self.log.len() + 1 == self.op_number {
             self.log.push((self.op_number, request.clone()));
         }
-
-        let mut effects = vec![];
 
         let prepare = Message::Prepare {
             op: request.op.clone(),
@@ -156,13 +166,20 @@ where
             request: Box::new(request.clone()),
         };
 
-        effects.push(Effect::Broadcast { to: self.configuration.clone(), message: prepare });
+        let replicas = self
+            .configuration
+            .clone()
+            .into_iter()
+            .filter(|&r| r != self.replica_number)
+            .collect::<Vec<_>>();
 
-        let at = now + self.timeout_primary_idle_commit;
-        self.next_primary_idle_commit = Some(at);
-        effects.push(Effect::SetTimer { kind: TimerKind::PrimaryIdleCommit, at });
-
-        effects
+        replicas
+            .iter()
+            .map(|&r| Effect::Send {
+                to: r,
+                message: prepare.clone(),
+            })
+            .collect()
     }
 
     fn on_prepare(
@@ -171,7 +188,7 @@ where
         view_number: ReplicaId,
         op_number: usize,
         commit_number: usize,
-        now: u64
+        now: u64,
     ) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) {
             return vec![];
@@ -180,7 +197,10 @@ where
         let mut effects = vec![];
 
         if self.log.len() + 1 == op_number {
-            println!("pushing op_number: {:?}, replica_number: {:?}, request: {:?}", op_number, self.replica_number, request);
+            println!(
+                "pushing op_number: {:?}, replica_number: {:?}, request: {:?}",
+                op_number, self.replica_number, request
+            );
             self.log.push((op_number, *request));
         }
 
@@ -193,17 +213,31 @@ where
             commit_number,
         };
 
-        effects.push(Effect::Send { to: self.view_number, message: prepare_ok });
+        effects.push(Effect::Send {
+            to: self.view_number,
+            message: prepare_ok,
+        });
 
         let at = now + self.timeout_backup_watchdog;
         self.next_backup_watchdog = Some(at);
-        effects.push(Effect::SetTimer { kind: TimerKind::BackupWatchdog, at });
-        effects.push(Effect::ApplyCommited { op_number: self.op_number });
+        effects.push(Effect::SetTimer {
+            kind: TimerKind::BackupWatchdog,
+            at,
+        });
+        effects.push(Effect::ApplyCommited {
+            op_number: self.op_number,
+        });
 
         effects
     }
 
-    fn on_prepare_ok(&mut self, view_number: ReplicaId, replica_number: ReplicaId, op_number: usize, commit_number: usize) -> Vec<Effect<Input, Output>> {
+    fn on_prepare_ok(
+        &mut self,
+        view_number: ReplicaId,
+        replica_number: ReplicaId,
+        op_number: usize,
+        commit_number: usize,
+    ) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) || !self.is_primary() {
             return vec![];
         }
@@ -212,7 +246,10 @@ where
             return vec![];
         }
 
-        self.op_ack_table.entry(op_number).or_insert(vec![]).push(replica_number);
+        self.op_ack_table
+            .entry(op_number)
+            .or_insert(vec![])
+            .push(replica_number);
 
         let quorum = self.get_quorum();
         if self.op_ack_table.get(&op_number).unwrap_or(&vec![]).len() < quorum {
@@ -229,7 +266,10 @@ where
             result: Some(result),
         };
 
-        effects.push(Effect::Reply { client_id: request.client_id.clone(), message: reply });
+        effects.push(Effect::Reply {
+            client_id: request.client_id.clone(),
+            message: reply,
+        });
 
         effects
     }
@@ -267,7 +307,10 @@ where
     pub fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
         // TODO: Validate how exactly we should retrieve the op_number to be committed.
         // From the original implementation, seems that it does op_number - 1. Why? Not sure yet.
-        println!("committing op_number: {:?}, log: {:?}, replica_number: {:?}", op_number, self.log, self.replica_number);
+        println!(
+            "committing op_number: {:?}, log: {:?}, replica_number: {:?}",
+            op_number, self.log, self.replica_number
+        );
         let op_number = if op_number == 0 { 0 } else { op_number - 1 };
         println!("op_number: {:?}", op_number);
         let (_op_number, request) = self.log.get(op_number).unwrap();
@@ -275,7 +318,8 @@ where
         let result = sm.borrow_mut().apply(request.op.clone());
         let mut request = request.clone();
         request.result = Some(result.clone());
-        self.client_table.insert(request.client_id.clone(), request.clone());
+        self.client_table
+            .insert(request.client_id.clone(), request.clone());
         (result, request)
     }
 }

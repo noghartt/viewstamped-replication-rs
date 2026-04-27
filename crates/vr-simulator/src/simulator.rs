@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use tracing::{debug, error, info};
 
 use vr_replica::message::ClientRequest;
 use vr_replica::{clock::TimerKind, effect::Effect, message::Message, replica::Replica};
@@ -37,6 +38,7 @@ pub struct Link {
     pub dup_pct: u8,
 }
 
+#[derive(Debug)]
 enum WheelEvent<Input> {
     Deliver(NodeKind),
     FireTimer { node: NodeId, kind: TimerKind },
@@ -72,7 +74,7 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     config: SimulatorConfig,
 }
 
-impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
+impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     pub fn new(config: Option<SimulatorConfig>) -> Self {
         Self {
             now: 0,
@@ -85,12 +87,26 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
         }
     }
 
+    pub fn run(&mut self) {
+        self.run_until(self.config.run_until_max_time.unwrap_or(u64::MAX))
+    }
+
+    pub fn run_until(&mut self, max_time: u64) {
+        debug!(config = ?self.config, "running simulation",);
+        while let Some((&at, _)) = self.wheel.iter().next() {
+            if at > max_time {
+                break;
+            }
+            self.step()
+        }
+    }
+
     pub fn get_clients(&self) -> Vec<Client> {
         self.clients.values().cloned().collect()
     }
 
     pub fn get_replicas(&self) -> Vec<&Replica<Input, Op>> {
-        self.replicas.values().map(|r| r).collect()
+        self.replicas.values().collect()
     }
 
     pub fn get_links(&self) -> Links {
@@ -103,14 +119,14 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
         };
 
         self.schedule(self.now, WheelEvent::ClientThink { client_id, op });
-        
+
         true
     }
 
     pub fn add_replica(&mut self, id: NodeId, r: Replica<Input, Op>) {
         // Only schedule timers based on replica role, and not immediately at time 0
         let is_primary = r.view_number == r.replica_number;
-        
+
         self.replicas.insert(id, r);
         self.inbox.insert(NodeKind::Replica(id), VecDeque::new());
 
@@ -118,9 +134,21 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
         if !self.config.disable_timers {
             let initial_delay = 100;
             if is_primary {
-                self.schedule(self.now + initial_delay, WheelEvent::FireTimer { node: id, kind: TimerKind::PrimaryIdleCommit });
+                self.schedule(
+                    self.now + initial_delay,
+                    WheelEvent::FireTimer {
+                        node: id,
+                        kind: TimerKind::PrimaryIdleCommit,
+                    },
+                );
             } else {
-                self.schedule(self.now + initial_delay, WheelEvent::FireTimer { node: id, kind: TimerKind::BackupWatchdog });
+                self.schedule(
+                    self.now + initial_delay,
+                    WheelEvent::FireTimer {
+                        node: id,
+                        kind: TimerKind::BackupWatchdog,
+                    },
+                );
             }
         }
     }
@@ -136,39 +164,24 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     }
 
     pub fn step(&mut self) {
-        println!("stepping");
         let Some((&at, evs)) = self.wheel.iter().next() else {
-            println!("no events to step");
             return;
         };
 
         let evs = self.wheel.remove(&at).unwrap();
         self.now = at;
 
+        debug!(now = self.now, events = ?evs, "triggering step");
+
         for ev in evs {
             match ev {
                 WheelEvent::Deliver(to) => self.deliver_one(to),
-                WheelEvent::FireTimer { node, kind } => self.fire_timer(NodeKind::Replica(node), kind),
+                WheelEvent::FireTimer { node, kind } => {
+                    self.fire_timer(NodeKind::Replica(node), kind)
+                }
                 WheelEvent::ClientThink { client_id, op } => self.client_think(client_id, op),
             }
         }
-    }
-
-    pub fn run(&mut self) {
-        self.run_until(self.config.run_until_max_time.unwrap_or(u64::MAX))
-    }
-
-    pub fn run_until(&mut self, max_time: u64) {
-        println!("running until time {}", max_time);
-        while let Some((&at, _)) = self.wheel.iter().next() {
-            if at > max_time {
-                println!("reached max simulation time: {}", max_time);
-                break;
-            }
-            println!("stepping at time {}", at);
-            self.step()
-        }
-        println!("simulation finished at time {}", self.now);
     }
 
     fn schedule(&mut self, at: u64, event: WheelEvent<Input>) {
@@ -185,11 +198,13 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     fn deliver_to_replica(&mut self, dst: NodeId) {
         if let Some(q) = self.inbox.get_mut(&NodeKind::Replica(dst)) {
             if let Some(ev) = q.pop_front() {
+                debug!(event = ?ev, destination = ?dst, "deliver to replica");
                 let r = self.replicas.get_mut(&dst).unwrap();
                 let mut effs = match ev {
                     Event::Msg(m) => r.on_message(m.clone(), self.now),
                     Event::TimerFired(_) => r.tick(self.now),
                 };
+                debug!(destination = ?dst, effects = ?effs, "received effects from replicas");
                 self.apply_effects(dst, &mut effs);
             }
         }
@@ -206,8 +221,11 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
 
     fn fire_timer(&mut self, node: NodeKind, kind: TimerKind) {
         // feed a timer-firing via the inbox so Replica::tick runs
-        self.inbox.get_mut(&node).unwrap().push_back(Event::TimerFired(kind));
-        self.schedule(self.now, WheelEvent::Deliver(node.clone()));
+        self.inbox
+            .get_mut(&node)
+            .unwrap()
+            .push_back(Event::TimerFired(kind));
+        self.schedule(self.now, WheelEvent::Deliver(node));
     }
 
     fn client_think(&mut self, client_id: NodeId, op: Input) {
@@ -224,7 +242,14 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
 
         let current_primary = client.configuration[client.current_view as usize];
         let replica_id = NodeId(current_primary);
-        self.send(NodeKind::Client(client_id), NodeKind::Replica(replica_id), request);
+
+        debug!(destination = ?replica_id, primary = current_primary, req = ?request, "triggering client request");
+
+        self.send(
+            NodeKind::Client(client_id),
+            NodeKind::Replica(replica_id),
+            request,
+        );
     }
 
     fn apply_effects(&mut self, from: NodeId, effs: &mut Vec<Effect<Input, Op>>) {
@@ -237,13 +262,11 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                 }
                 Effect::Reply { client_id, message } => {
                     assert!(matches!(message, Message::Reply { .. }));
-                    self.send(NodeKind::Replica(from), NodeKind::Client(NodeId(client_id)), message);
-                }
-                Effect::Broadcast { to, message } => {
-                    for replica_id in to {
-                        let replica_id = NodeId(replica_id);
-                        self.send(NodeKind::Replica(from), NodeKind::Replica(replica_id), message.clone());
-                    }
+                    self.send(
+                        NodeKind::Replica(from),
+                        NodeKind::Client(NodeId(client_id)),
+                        message,
+                    );
                 }
                 Effect::SetTimer { kind, at } => {
                     if !self.config.disable_timers {
@@ -256,7 +279,7 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                     let r = self.replicas.get(&from).unwrap();
                     r.clone().commit_op(op_number);
                 }
-                e => todo!("{:?}", e)
+                e => todo!("{:?}", e),
             }
         }
     }
@@ -272,9 +295,14 @@ impl <Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
 
         let base_ms = l.base_ms;
         // TODO: Add jitter, drop, and RNG
-        self.inbox.get_mut(&to).unwrap().push_back(Event::Msg(m.clone()));
+        self.inbox
+            .get_mut(&to)
+            .unwrap()
+            .push_back(Event::Msg(m.clone()));
         let at = self.now + base_ms;
-        println!("sending message: {:?}, {:?} -> {:?}, at: {:?}", m, from, to, at);
+
+        debug!(at = at, from = ?from, to = ?to, msg = ?m, "sending message");
+
         self.schedule(at, WheelEvent::Deliver(to));
     }
 }
