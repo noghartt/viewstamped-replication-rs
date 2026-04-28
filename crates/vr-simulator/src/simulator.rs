@@ -1,4 +1,8 @@
+use rand::{Rng, RngExt};
+use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::{ChaCha8Rng, ChaCha20Rng};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::DerefMut;
 use tracing::debug;
 
 use vr_replica::message::ClientRequest;
@@ -59,9 +63,9 @@ impl Default for SimulatorConfig {
     }
 }
 
-// TODO: Add RNG
 pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     pub now: u64,
+    rng: ChaCha8Rng,
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
 
     replicas: HashMap<NodeId, Replica<Input, Op>>,
@@ -75,7 +79,24 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
 
 impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     pub fn new(config: Option<SimulatorConfig>) -> Self {
+        let rng = ChaCha8Rng::seed_from_u64(0);
         Self {
+            rng,
+            now: 0,
+            wheel: BTreeMap::new(),
+            replicas: HashMap::new(),
+            inbox: HashMap::new(),
+            links: Links(HashMap::new()),
+            clients: HashMap::new(),
+            config: config.unwrap_or_default(),
+        }
+    }
+
+    pub fn with_seed(config: Option<SimulatorConfig>, seed: u64) -> Self {
+        let rng = ChaCha8Rng::seed_from_u64(seed);
+        debug!(seed = seed, "Setup simulator with seed");
+        Self {
+            rng,
             now: 0,
             wheel: BTreeMap::new(),
             replicas: HashMap::new(),
@@ -260,24 +281,41 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     }
 
     fn send(&mut self, from: NodeKind, to: NodeKind, m: Message<Input, Op>) {
-        let Some(l) = self.links.0.get(&(from, to)) else {
-            return;
+        let (up, base_ms, jitter_ms, drop_pct, dup_pct) = match self.links.0.get(&(from, to)) {
+            Some(l) => (l.up, l.base_ms, l.jitter_ms, l.drop_pct, l.dup_pct),
+            None => return,
         };
 
-        if !l.up {
+        if !up {
             return;
         }
 
-        let base_ms = l.base_ms;
-        // TODO: Add jitter, drop, and RNG
+        if self.rng.random_range(0..100) < drop_pct {
+            debug!(from = ?from, to = ?to, "dropped");
+            return;
+        }
+
+        let jitter = if jitter_ms == 0 {
+            0
+        } else {
+            self.rng.random_range(0..=jitter_ms)
+        };
+
+        let at = self.now + base_ms + jitter;
+
         self.inbox
             .get_mut(&to)
             .unwrap()
             .push_back(Event::Msg(m.clone()));
-        let at = self.now + base_ms;
 
         debug!(at = at, from = ?from, to = ?to, msg = ?m, "sending message");
 
         self.schedule(at, WheelEvent::Deliver(to));
+        if self.rng.random_range(0..100) < dup_pct {
+            let dup_jitter = self.rng.random_range(0..=jitter_ms.max(1));
+            let at = self.now + base_ms + dup_jitter;
+            debug!(at = at, from = ?from, to = ?to, "duplicated message");
+            self.schedule(at, WheelEvent::Deliver(to))
+        }
     }
 }

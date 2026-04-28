@@ -10,3 +10,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-serde = { workspace = true  }
 tracing-subscriber = { workspace = true }
+rand_chacha = "0.10.0"
+rand_core = "0.10.1"
+rand = "0.10.1"

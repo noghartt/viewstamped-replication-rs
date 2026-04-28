@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::rc::Rc;
 
@@ -33,9 +33,9 @@ where
     pub op_number: usize,
     pub commit_number: usize,
     pub log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
-    client_table: HashMap<u64, ClientRequest<Input, Output>>,
+    client_table: BTreeMap<u64, ClientRequest<Input, Output>>,
 
-    pub op_ack_table: HashMap<OpNumber, Vec<ReplicaId>>,
+    pub op_ack_table: BTreeMap<OpNumber, Vec<ReplicaId>>,
 
     pub state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
 }
@@ -63,8 +63,8 @@ where
             epoch: 0,
             status: Status::Normal,
             log: Vec::new(),
-            client_table: HashMap::new(),
-            op_ack_table: HashMap::new(),
+            client_table: BTreeMap::new(),
+            op_ack_table: BTreeMap::new(),
         }
     }
 
@@ -205,7 +205,7 @@ where
 
         self.op_ack_table
             .entry(op_number)
-            .or_insert(vec![])
+            .or_default()
             .push(replica_number);
 
         let quorum = self.get_quorum();

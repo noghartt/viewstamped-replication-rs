@@ -1,8 +1,34 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+use std::sync::Once;
+
 mod client;
 mod events;
 mod simulator;
+
+fn get_log_level() -> tracing::Level {
+    let Ok(log_env) = std::env::var("LOG_LEVEL") else {
+        return tracing::Level::INFO;
+    };
+
+    match log_env.as_str() {
+        "debug" => tracing::Level::DEBUG,
+        "error" => tracing::Level::ERROR,
+        "warn" => tracing::Level::WARN,
+        "trace" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
+    }
+}
+
+static TRACING: Once = Once::new();
+fn init_tracing() {
+    TRACING.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_max_level(get_log_level())
+            // .json()
+            .init();
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -14,7 +40,11 @@ mod tests {
     use vr_replica::state_machine::StateMachine;
 
     use crate::client::{Client, Op};
+    use crate::init_tracing;
     use crate::simulator::{Link, NodeId, NodeKind, Simulator, SimulatorConfig};
+
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
 
     #[test]
     fn test_setup_clients_and_replicas() {
@@ -85,12 +115,14 @@ mod tests {
 
     #[test]
     fn test_connect_client_to_replica() {
+        init_tracing();
+
         let config = SimulatorConfig {
             disable_timers: true,
             ..Default::default()
         };
 
-        let mut sim = Simulator::<Op>::new(Some(config));
+        let mut sim = Simulator::<Op>::with_seed(Some(config), get_seed());
         setup_clients_and_replicas(&mut sim, 2, 3);
 
         let clients = sim.get_clients();
@@ -102,11 +134,6 @@ mod tests {
     }
 
     fn setup_clients_and_replicas(sim: &mut Simulator<Op>, client_count: u64, replica_count: u64) {
-        tracing_subscriber::fmt()
-            .with_max_level(get_log_level())
-            // .json()
-            .init();
-
         let configuration = (0..replica_count).map(|i| i).collect::<Vec<_>>();
         let mut replicas = Vec::new();
         for i in 0..replica_count {
@@ -126,8 +153,8 @@ mod tests {
         let link = Link {
             base_ms: 100,
             jitter_ms: 10,
-            drop_pct: 0,
-            dup_pct: 0,
+            drop_pct: 80,
+            dup_pct: 80,
             up: true,
         };
 
@@ -197,17 +224,10 @@ mod tests {
         }
     }
 
-    fn get_log_level() -> tracing::Level {
-        let Ok(log_env) = std::env::var("LOG_LEVEL") else {
-            return tracing::Level::INFO;
-        };
-
-        match log_env.as_str() {
-            "debug" => tracing::Level::DEBUG,
-            "error" => tracing::Level::ERROR,
-            "warn" => tracing::Level::WARN,
-            "trace" => tracing::Level::TRACE,
-            _ => tracing::Level::INFO,
-        }
+    fn get_seed() -> u64 {
+        std::env::var("SEED")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(rand::random)
     }
 }
