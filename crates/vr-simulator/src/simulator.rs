@@ -255,12 +255,6 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                         message,
                     );
                 }
-                // Apply/commit prepared operation in backups in the moment it will be responded as PrepareOk to the primary replica.
-                Effect::ApplyCommited { op_number } => {
-                    let r = self.replicas.get(&from).unwrap();
-                    r.clone().commit_op(op_number);
-                }
-                e => todo!("{:?}", e),
             }
         }
     }

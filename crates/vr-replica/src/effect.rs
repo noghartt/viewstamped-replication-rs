@@ -6,9 +6,6 @@ pub enum Effect<I, O> {
         to: ReplicaId,
         message: Message<I, O>,
     },
-    ApplyCommited {
-        op_number: OpNumber,
-    },
     Reply {
         client_id: u64,
         message: Message<I, O>,
@@ -24,9 +21,6 @@ where
         match self {
             Effect::Send { to, message } => {
                 write!(f, "Send {{ to: {:?}, message: {:?} }}", to, message)
-            }
-            Effect::ApplyCommited { op_number } => {
-                write!(f, "ApplyCommited {{ op_number: {:?} }}", op_number)
             }
             Effect::Reply { client_id, message } => write!(
                 f,
