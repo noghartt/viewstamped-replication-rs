@@ -1046,7 +1046,6 @@ version = "0.1.0"
 dependencies = [
  "rand",
  "rand_chacha",
- "rand_core",
  "serde",
  "serde_json",
  "tracing",

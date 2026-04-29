@@ -1,9 +1,8 @@
-use rand::{Rng, RngExt};
+use rand::RngExt;
+use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
-use rand_chacha::{ChaCha8Rng, ChaCha20Rng};
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::ops::DerefMut;
-use tracing::debug;
+use std::collections::{BTreeMap, VecDeque};
+use tracing::{debug, info};
 
 use vr_replica::message::ClientRequest;
 use vr_replica::{effect::Effect, message::Message, replica::Replica};
@@ -12,13 +11,13 @@ use crate::client::{Client, Op};
 use crate::events::Event;
 
 #[derive(Clone)]
-pub struct Links(pub HashMap<(NodeKind, NodeKind), Link>);
+pub struct Links(pub BTreeMap<(NodeKind, NodeKind), Link>);
 
 #[cfg(test)]
 impl std::fmt::Debug for Links {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for ((a, b), l) in &self.0 {
-            write!(f, "{:?} -> {:?} -> {:?}\n", a, b, l)?;
+            writeln!(f, "{:?} -> {:?} -> {:?}\n", a, b, l)?;
         }
         Ok(())
     }
@@ -48,61 +47,44 @@ enum WheelEvent<Input> {
     ClientThink { client_id: NodeId, op: Input },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SimulatorConfig {
     pub disable_timers: bool,
     pub run_until_max_time: Option<u64>,
 }
 
-impl Default for SimulatorConfig {
-    fn default() -> Self {
-        Self {
-            disable_timers: false,
-            run_until_max_time: None,
-        }
-    }
-}
-
 pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     pub now: u64,
     rng: ChaCha8Rng,
+    seed: u64,
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
 
-    replicas: HashMap<NodeId, Replica<Input, Op>>,
-    inbox: HashMap<NodeKind, VecDeque<Event<Input>>>,
+    replicas: BTreeMap<NodeId, Replica<Input, Op>>,
+    inbox: BTreeMap<NodeKind, VecDeque<Event<Input>>>,
     links: Links,
 
-    clients: HashMap<NodeId, Client>,
+    clients: BTreeMap<NodeId, Client>,
 
     config: SimulatorConfig,
 }
 
 impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     pub fn new(config: Option<SimulatorConfig>) -> Self {
-        let rng = ChaCha8Rng::seed_from_u64(0);
-        Self {
-            rng,
-            now: 0,
-            wheel: BTreeMap::new(),
-            replicas: HashMap::new(),
-            inbox: HashMap::new(),
-            links: Links(HashMap::new()),
-            clients: HashMap::new(),
-            config: config.unwrap_or_default(),
-        }
+        Self::with_seed(config, 0)
     }
 
     pub fn with_seed(config: Option<SimulatorConfig>, seed: u64) -> Self {
         let rng = ChaCha8Rng::seed_from_u64(seed);
-        debug!(seed = seed, "Setup simulator with seed");
+        info!(seed = seed, "Creating simulator with seed");
         Self {
             rng,
+            seed,
             now: 0,
             wheel: BTreeMap::new(),
-            replicas: HashMap::new(),
-            inbox: HashMap::new(),
-            links: Links(HashMap::new()),
-            clients: HashMap::new(),
+            replicas: BTreeMap::new(),
+            inbox: BTreeMap::new(),
+            links: Links(BTreeMap::new()),
+            clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
         }
     }
