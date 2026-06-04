@@ -28,13 +28,13 @@ pub struct Client {
 
 impl Client {
     pub fn new(id: NodeId, configuration: Vec<u64>) -> Self {
-        Self { 
-            id, 
-            state: HashMap::new(), 
-            configuration, 
-            current_view: 0, 
-            request_number: 0, 
-            epoch: 0, 
+        Self {
+            id,
+            state: HashMap::new(),
+            configuration,
+            current_view: 0,
+            request_number: 0,
+            epoch: 0,
         }
     }
 
@@ -50,7 +50,7 @@ impl Client {
                 if let Some(op) = result {
                     self.apply_op(op);
                 }
-            },
+            }
             _ => panic!("Unexpected message"),
         }
     }
@@ -59,8 +59,8 @@ impl Client {
         match op {
             Op::Set(key, value) => {
                 self.state.insert(key, value);
-            },
-            _ => todo!()
+            }
+            _ => todo!(),
         }
     }
 }
@@ -73,8 +73,8 @@ impl StateMachine for Client {
         match input {
             Op::Set(key, value) => {
                 self.state.insert(key, value);
-            },
-            _ => todo!()
+            }
+            _ => todo!(),
         }
     }
 }

@@ -70,10 +70,10 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
 
 impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
     pub fn new(config: Option<SimulatorConfig>) -> Self {
-        Self::with_seed(config, 0)
+        Self::with_seed(0, config)
     }
 
-    pub fn with_seed(config: Option<SimulatorConfig>, seed: u64) -> Self {
+    pub fn with_seed(seed: u64, config: Option<SimulatorConfig>) -> Self {
         let rng = ChaCha8Rng::seed_from_u64(seed);
         info!(seed = seed, "Creating simulator with seed");
         Self {
@@ -105,14 +105,6 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
 
     pub fn get_clients(&self) -> Vec<Client> {
         self.clients.values().cloned().collect()
-    }
-
-    pub fn get_replicas(&self) -> Vec<&Replica<Input, Op>> {
-        self.replicas.values().collect()
-    }
-
-    pub fn get_links(&self) -> Links {
-        self.links.clone()
     }
 
     pub fn start_client_request(&mut self, client_id: NodeId, op: Input) -> bool {
@@ -226,6 +218,7 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
         let request = Message::Request::<Input, Op>(ClientRequest {
             client_id: client_id.0,
             op,
+            // TODO: Fix the request_number here to not be a hardcoded one.
             request_number: 0,
             result: None,
         });
@@ -258,6 +251,9 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
                         message,
                     );
                 }
+                Effect::Committed { replica, op } => debug!(replica, op, "commited effect"),
+                Effect::RequestReceived { replica } => debug!(replica, "request received"),
+                Effect::Prepared { replica, op } => debug!(replica, op, "prepared"),
             }
         }
     }

@@ -1,0 +1,258 @@
+use std::collections::HashMap;
+use std::sync::Once;
+use std::{cell::RefCell, rc::Rc};
+
+use clap::{Args, Parser};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+mod client;
+mod events;
+mod simulator;
+
+use simulator::{Link, NodeId, NodeKind, Simulator};
+use vr_replica::{replica::Replica, state_machine::StateMachine};
+
+use crate::client::{Client, Op};
+use crate::simulator::SimulatorConfig;
+
+#[derive(Parser, Debug)]
+#[command(
+    version,
+    about = "Run deterministic Viewstamped Replication simulations"
+)]
+struct Cli {
+    #[command(flatten)]
+    modes: Modes,
+
+    #[command(flatten)]
+    config: CliConfig,
+}
+
+#[derive(Args, Debug)]
+// Creates a group where only 1 argument is allowed, and at least 1 is required
+#[group(required = true, multiple = false)]
+struct Modes {
+    #[arg(short, long, value_name = "SEED")]
+    seed: Option<u64>,
+
+    #[arg(
+        long = "max-samples",
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    max_samples: Option<u64>,
+}
+
+#[derive(Args, Clone, Debug)]
+struct CliConfig {
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+    replicas: u64,
+
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    clients: u64,
+
+    #[arg(alias = "config-run-until-max-time")]
+    run_until_max_time: Option<u64>,
+
+    #[arg(default_value_t = 1)]
+    link_base_ms: u64,
+
+    #[arg(default_value_t = 0)]
+    link_jitter_ms: u64,
+
+    #[arg(default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+    link_drop_pct: u8,
+
+    #[arg(default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+    link_dup_pct: u8,
+
+    #[arg(long, default_value_t = false)]
+    disable_timers: bool,
+}
+
+enum Mode {
+    Single(u64),
+    MaxSamples(u64),
+}
+
+fn main() {
+    init_tracing();
+
+    let args = Cli::parse();
+
+    let mode = get_mode(args.modes);
+    match mode {
+        Mode::Single(seed) => run_single_simulation(seed, &args.config),
+        Mode::MaxSamples(max_samples) => run_max_samples_simulations(max_samples, &args.config),
+    }
+}
+
+fn run_single_simulation(seed: u64, config: &CliConfig) {
+    let mut simulator = setup_simulation(seed, config);
+    simulator.run();
+
+    print_simulation_summary(seed, &simulator);
+}
+
+fn run_max_samples_simulations(max_samples: u64, config: &CliConfig) {
+    for _ in 0..max_samples {
+        let seed = rand::random();
+        run_single_simulation(seed, config);
+    }
+}
+
+fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
+    let simulator_config = SimulatorConfig {
+        disable_timers: config.disable_timers,
+        run_until_max_time: config.run_until_max_time,
+    };
+
+    let mut simulator = Simulator::with_seed(seed, Some(simulator_config));
+    let replica_ids = replica_ids(config.replicas);
+    let client_ids = client_ids(config.clients);
+    let replica_configuration = replica_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+
+    for replica_id in &replica_ids {
+        let state_machine = Rc::new(RefCell::new(ReplicaState::default()));
+        let replica = Replica::new(replica_configuration.clone(), replica_id.0, state_machine);
+        simulator.add_replica(*replica_id, replica);
+    }
+
+    for client_id in &client_ids {
+        let client = Client::new(*client_id, replica_configuration.clone());
+        simulator.add_client(*client_id, client);
+    }
+
+    setup_links(&mut simulator, &replica_ids, &client_ids, config);
+    start_seeded_workload(&mut simulator, &client_ids);
+
+    simulator
+}
+
+fn get_mode(modes: Modes) -> Mode {
+    match modes {
+        Modes {
+            seed: Some(seed),
+            max_samples: None,
+        } => Mode::Single(seed),
+        Modes {
+            seed: None,
+            max_samples: Some(max_samples),
+        } => Mode::MaxSamples(max_samples),
+        _ => panic!("You should pick either single or simulation mode."),
+    }
+}
+
+fn replica_ids(count: u64) -> Vec<NodeId> {
+    (0..count).map(NodeId).collect()
+}
+
+fn client_ids(count: u64) -> Vec<NodeId> {
+    (0..count).map(NodeId).collect()
+}
+
+fn setup_links(
+    simulator: &mut Simulator<Op>,
+    replicas: &[NodeId],
+    clients: &[NodeId],
+    config: &CliConfig,
+) {
+    let link = Link {
+        up: true,
+        base_ms: config.link_base_ms,
+        jitter_ms: config.link_jitter_ms,
+        drop_pct: config.link_drop_pct,
+        dup_pct: config.link_dup_pct,
+    };
+
+    for (index, src) in replicas.iter().enumerate() {
+        for dst in replicas.iter().skip(index + 1) {
+            simulator.set_link(
+                NodeKind::Replica(*src),
+                NodeKind::Replica(*dst),
+                link.clone(),
+            );
+        }
+    }
+
+    for client in clients {
+        for replica in replicas {
+            simulator.set_link(
+                NodeKind::Client(*client),
+                NodeKind::Replica(*replica),
+                link.clone(),
+            );
+        }
+    }
+}
+
+fn start_seeded_workload(simulator: &mut Simulator<Op>, clients: &[NodeId]) {
+    for client_id in clients {
+        let key = format!("client-{}", client_id.0);
+        let started = simulator.start_client_request(*client_id, Op::Set(key, client_id.0));
+        assert!(
+            started,
+            "client {:?} should exist before workload setup",
+            client_id
+        );
+    }
+}
+
+fn print_simulation_summary(seed: u64, simulator: &Simulator<Op>) {
+    println!("finished simulation seed={seed} now={}", simulator.now);
+
+    for client in simulator.get_clients() {
+        println!("client={} state={:?}", client.id.0, client.state);
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReplicaState {
+    state: HashMap<String, u64>,
+}
+
+impl StateMachine for ReplicaState {
+    type Input = Op;
+    type Output = Op;
+
+    fn apply(&mut self, input: Self::Input) -> Self::Output {
+        match input {
+            Op::Set(key, value) => {
+                self.state.insert(key.clone(), value);
+                Op::Set(key, value)
+            }
+            Op::Get(key, _) => {
+                let value = self.state.get(&key).cloned();
+                Op::Get(key, value)
+            }
+            Op::Del(key) => {
+                self.state.remove(&key);
+                Op::Del(key)
+            }
+        }
+    }
+}
+
+fn get_log_level() -> tracing::Level {
+    let Ok(log_env) = std::env::var("LOG_LEVEL") else {
+        return tracing::Level::INFO;
+    };
+
+    match log_env.as_str() {
+        "debug" => tracing::Level::DEBUG,
+        "error" => tracing::Level::ERROR,
+        "warn" => tracing::Level::WARN,
+        "trace" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
+    }
+}
+
+static TRACING: Once = Once::new();
+fn init_tracing() {
+    TRACING.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_max_level(get_log_level())
+            .init()
+    });
+}

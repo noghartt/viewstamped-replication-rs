@@ -84,14 +84,6 @@ where
                 op_number,
                 commit_number,
             } => self.on_prepare_ok(view_number, replica_number, op_number, commit_number),
-            Message::Commit {
-                op_number,
-                commit_number,
-                view_number,
-            } => {
-                self.on_commit(op_number, commit_number, view_number);
-                vec![]
-            }
             m => panic!("unexpected message: {:?}", m),
         }
     }
@@ -150,6 +142,7 @@ where
             .collect()
     }
 
+    // TODO: Add the implementation for the State Transfer ""
     fn on_prepare(
         &mut self,
         request: Box<ClientRequest<Input, Output>>,
@@ -164,11 +157,11 @@ where
         let mut effects = vec![];
 
         if self.log.len() + 1 == op_number {
-            println!(
-                "pushing op_number: {:?}, replica_number: {:?}, request: {:?}",
-                op_number, self.replica_number, request
-            );
             self.log.push((op_number, *request));
+            effects.push(Effect::Prepared {
+                replica: self.replica_number,
+                op: op_number,
+            });
         }
 
         self.commit_number = commit_number;
@@ -231,16 +224,26 @@ where
         effects
     }
 
-    fn on_commit(&mut self, op_number: OpNumber, commit_number: usize, view_number: ReplicaId) {
+    fn on_commit(
+        &mut self,
+        op_number: OpNumber,
+        commit_number: usize,
+        view_number: ReplicaId,
+    ) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) || self.is_primary() {
-            return;
+            return Vec::new();
         }
 
         if op_number == self.op_number {
-            return;
+            return Vec::new();
         }
 
         let _ = self.commit_op(op_number);
+
+        vec![Effect::Committed {
+            replica: self.replica_number,
+            op: op_number,
+        }]
     }
 
     #[inline]
@@ -264,19 +267,13 @@ where
     pub fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
         // TODO: Validate how exactly we should retrieve the op_number to be committed.
         // From the original implementation, seems that it does op_number - 1. Why? Not sure yet.
-        println!(
-            "committing op_number: {:?}, log: {:?}, replica_number: {:?}",
-            op_number, self.log, self.replica_number
-        );
         let op_number = if op_number == 0 { 0 } else { op_number - 1 };
-        println!("op_number: {:?}", op_number);
         let (_op_number, request) = self.log.get(op_number).unwrap();
         let sm = self.state_machine.clone();
         let result = sm.borrow_mut().apply(request.op.clone());
         let mut request = request.clone();
         request.result = Some(result.clone());
-        self.client_table
-            .insert(request.client_id.clone(), request.clone());
+        self.client_table.insert(request.client_id, request.clone());
         (result, request)
     }
 }
