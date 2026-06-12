@@ -9,7 +9,7 @@ use crate::state_machine::StateMachine;
 use crate::types::{OpNumber, ReplicaId};
 use tracing::debug;
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Normal,
     ViewChange,

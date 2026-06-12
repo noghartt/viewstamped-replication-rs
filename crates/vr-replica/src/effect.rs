@@ -1,9 +1,7 @@
-use serde::Serialize;
-
 use crate::message::Message;
 use crate::types::{OpNumber, ReplicaId};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub enum Effect<I, O> {
     Send {
         to: ReplicaId,

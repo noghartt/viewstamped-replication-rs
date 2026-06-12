@@ -4,10 +4,17 @@ use std::{cell::RefCell, rc::Rc};
 
 use clap::{Args, Parser};
 
+mod client;
+mod network;
+mod simulator;
+mod types;
+
+use simulator::Simulator;
+use types::NodeId;
 use vr_replica::{replica::Replica, state_machine::StateMachine};
-use vr_simulator::client::{Client, Op};
-use vr_simulator::simulator::{Simulator, SimulatorConfig};
-use vr_simulator::types::NodeId;
+
+use crate::client::{Client, Op};
+use crate::simulator::SimulatorConfig;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,11 +69,6 @@ struct CliConfig {
 
     #[arg(long, default_value_t = false)]
     disable_timers: bool,
-
-    /// Dump the run's typed history as JSON Lines (§12.0). Diff two dumps of
-    /// the same seed to check the determinism boundary by hand.
-    #[arg(long, value_name = "PATH")]
-    dump_trace: Option<std::path::PathBuf>,
 }
 
 enum Mode {
@@ -91,13 +93,6 @@ fn run_single_simulation(seed: u64, config: &CliConfig) {
     simulator.run();
 
     print_simulation_summary(seed, &simulator);
-
-    if let Some(path) = &config.dump_trace {
-        let mut file = std::fs::File::create(path).expect("failed to create trace file");
-        vr_simulator::history::dump_jsonl(&simulator.history, &mut file)
-            .expect("failed to write trace");
-        println!("trace dumped to {} ({} events)", path.display(), simulator.history.len());
-    }
 }
 
 fn run_max_samples_simulations(max_samples: u64, config: &CliConfig) {

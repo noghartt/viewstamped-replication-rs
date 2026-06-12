@@ -1,8 +1,6 @@
-use serde::Serialize;
-
 use crate::types::ReplicaId;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct ClientRequest<I, O> {
     pub op: I,
     pub client_id: u64,
@@ -10,7 +8,7 @@ pub struct ClientRequest<I, O> {
     pub result: Option<O>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub enum Message<I, O> {
     Error {
         message: String,

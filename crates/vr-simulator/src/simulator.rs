@@ -8,7 +8,6 @@ use vr_replica::message::{ClientRequest, Message};
 use vr_replica::replica::Replica;
 
 use crate::client::{Client, Op};
-use crate::history::RuntimeEvent;
 use crate::network::{Network, NetworkSendOutcome};
 use crate::types::{NodeId, NodeKind};
 
@@ -45,10 +44,6 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
 
     replicas: BTreeMap<NodeId, Replica<Input, Op>>,
     clients: BTreeMap<NodeId, Client>,
-
-    /// Typed trace of the run (§10 Phase A). Source of truth for invariant
-    /// predicates and the JSONL dump — see `history.rs`.
-    pub history: Vec<RuntimeEvent<Input, Op>>,
 }
 
 impl Simulator<Op> {
@@ -66,30 +61,7 @@ impl Simulator<Op> {
             replicas: BTreeMap::new(),
             clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
-            history: Vec::new(),
         }
-    }
-
-    fn record(&mut self, event: RuntimeEvent<Op, Op>) {
-        self.history.push(event);
-    }
-
-    /// Compact state snapshot after each batch of effects, so invariant
-    /// failures can show local replica state, not just messages in flight.
-    fn snapshot_replica(&mut self, node: NodeId) {
-        let Some(replica) = self.replicas.get(&node) else {
-            return;
-        };
-        let snapshot = RuntimeEvent::ReplicaSnapshot {
-            at: self.now,
-            node,
-            view: replica.view_number,
-            op_number: replica.op_number,
-            commit_number: replica.commit_number,
-            status: replica.status.clone(),
-            log: replica.log.clone(),
-        };
-        self.record(snapshot);
     }
 
     pub fn run(&mut self) {
@@ -155,11 +127,6 @@ impl Simulator<Op> {
 
     fn deliver(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
         debug!(now = self.now, ?from, ?to, ?message, "delivering message");
-        self.record(RuntimeEvent::MessageDelivered {
-            at: self.now,
-            to,
-            msg: message.clone(),
-        });
         match to {
             NodeKind::Replica(id) => {
                 let Some(replica) = self.replicas.get_mut(&id) else {
@@ -168,28 +135,13 @@ impl Simulator<Op> {
                 };
                 let effects = replica.on_message(message);
                 self.apply_effects(to, effects);
-                self.snapshot_replica(id);
             }
             NodeKind::Client(id) => {
                 let Some(client) = self.clients.get_mut(&id) else {
                     debug!(?id, "message to unknown client dropped");
                     return;
                 };
-                if let Message::Reply {
-                    request_id, result, ..
-                } = &message
-                {
-                    let replied = RuntimeEvent::ClientReplied {
-                        at: self.now,
-                        client: id,
-                        request_number: *request_id as u64,
-                        result: result.clone(),
-                    };
-                    client.on_message(message);
-                    self.record(replied);
-                } else {
-                    client.on_message(message);
-                }
+                client.on_message(message);
             }
         }
     }
@@ -201,20 +153,13 @@ impl Simulator<Op> {
         };
 
         let request = ClientRequest {
-            op: op.clone(),
+            op,
             client_id: client.id.0,
             request_number: client.request_number as usize,
             result: None,
         };
 
         let primary = client.believed_primary();
-        let request_number = client.request_number;
-        self.record(RuntimeEvent::ClientRequest {
-            at: self.now,
-            client: client_id,
-            request_number,
-            op,
-        });
         self.send(
             NodeKind::Client(client_id),
             NodeKind::Replica(NodeId(primary)),
@@ -231,15 +176,12 @@ impl Simulator<Op> {
                 Effect::Reply { client_id, message } => {
                     self.send(from, NodeKind::Client(NodeId(client_id)), message)
                 }
-                effect @ (Effect::RequestReceived { .. }
+                // Lifecycle effects become history records in §10 Phase A;
+                // until the recorder exists they are trace-only.
+                Effect::RequestReceived { .. }
                 | Effect::Prepared { .. }
-                | Effect::Committed { .. }) => {
+                | Effect::Committed { .. } => {
                     trace!(now = self.now, ?from, ?effect, "lifecycle effect");
-                    self.record(RuntimeEvent::EffectEmitted {
-                        at: self.now,
-                        by: from,
-                        effect,
-                    });
                 }
             }
         }
@@ -249,36 +191,12 @@ impl Simulator<Op> {
         match self.network.resolve_send(from, to, self.now, &mut self.rng) {
             NetworkSendOutcome::Dropped => {
                 trace!(now = self.now, ?from, ?to, ?message, "message dropped");
-                self.record(RuntimeEvent::MessageDropped {
-                    at: self.now,
-                    from,
-                    to,
-                    msg: message,
-                });
             }
             NetworkSendOutcome::Delivered { at } => {
-                self.record(RuntimeEvent::MessageSent {
-                    at: self.now,
-                    from,
-                    to,
-                    msg: message.clone(),
-                });
                 self.schedule_event(at, WheelEvent::Deliver { from, to, message });
             }
             NetworkSendOutcome::Duplicated { at, duplicated_at } => {
                 trace!(now = self.now, ?from, ?to, ?message, "message duplicated");
-                self.record(RuntimeEvent::MessageSent {
-                    at: self.now,
-                    from,
-                    to,
-                    msg: message.clone(),
-                });
-                self.record(RuntimeEvent::MessageDuplicated {
-                    at: self.now,
-                    from,
-                    to,
-                    msg: message.clone(),
-                });
                 self.schedule_event(
                     at,
                     WheelEvent::Deliver {
