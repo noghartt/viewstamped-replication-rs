@@ -1037,6 +1037,7 @@ dependencies = [
 name = "vr-replica"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tracing",
 ]
 

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use vr_replica::{message::Message, state_machine::StateMachine};
+use vr_replica::message::Message;
 
-use crate::{events::Event, simulator::NodeId};
+use crate::types::NodeId;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum Op {
     Set(String, u64),
     Get(String, Option<u64>),
@@ -14,7 +14,8 @@ pub enum Op {
 #[derive(Debug, Clone)]
 pub struct Client {
     pub id: NodeId,
-    pub state: HashMap<String, u64>,
+    pub state: BTreeMap<String, u64>,
+    pub replies_received: u64,
 
     /// A sorted array containing the IP addresses of the replicas in the system.
     pub configuration: Vec<u64>,
@@ -30,7 +31,8 @@ impl Client {
     pub fn new(id: NodeId, configuration: Vec<u64>) -> Self {
         Self {
             id,
-            state: HashMap::new(),
+            state: BTreeMap::new(),
+            replies_received: 0,
             configuration,
             current_view: 0,
             request_number: 0,
@@ -38,43 +40,35 @@ impl Client {
         }
     }
 
-    pub fn on_message<I: Clone + 'static>(&mut self, ev: Event<I>) -> () {
-        match ev {
-            Event::Msg(m) if matches!(m, Message::Reply { .. }) => {
-                let Message::Reply { result, .. } = m else {
-                    panic!("Unexpected message");
-                };
+    pub fn believed_primary(&self) -> u64 {
+        self.configuration[(self.current_view as usize) % self.configuration.len()]
+    }
 
+    pub fn on_message<I: std::fmt::Debug>(&mut self, message: Message<I, Op>) {
+        match message {
+            Message::Reply { result, .. } => {
+                self.replies_received += 1;
                 // TODO: Not sure if we should update the request_number only on reply.
                 self.request_number += 1;
                 if let Some(op) = result {
                     self.apply_op(op);
                 }
             }
-            _ => panic!("Unexpected message"),
+            // VR's rule for unexpected messages is ignore-and-drop; a panic
+            // here would kill an entire seed campaign on one stray message.
+            other => tracing::debug!(?other, "client ignoring unexpected message"),
         }
     }
 
-    fn apply_op(&mut self, op: Op) -> () {
+    fn apply_op(&mut self, op: Op) {
         match op {
             Op::Set(key, value) => {
                 self.state.insert(key, value);
             }
-            _ => todo!(),
-        }
-    }
-}
-
-impl StateMachine for Client {
-    type Input = Op;
-    type Output = ();
-
-    fn apply(&mut self, input: Self::Input) -> Self::Output {
-        match input {
-            Op::Set(key, value) => {
-                self.state.insert(key, value);
+            Op::Get(_, _) => {}
+            Op::Del(key) => {
+                self.state.remove(&key);
             }
-            _ => todo!(),
         }
     }
 }

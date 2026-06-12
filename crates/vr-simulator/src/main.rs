@@ -3,18 +3,11 @@ use std::sync::Once;
 use std::{cell::RefCell, rc::Rc};
 
 use clap::{Args, Parser};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 
-mod client;
-mod events;
-mod simulator;
-
-use simulator::{Link, NodeId, NodeKind, Simulator};
 use vr_replica::{replica::Replica, state_machine::StateMachine};
-
-use crate::client::{Client, Op};
-use crate::simulator::SimulatorConfig;
+use vr_simulator::client::{Client, Op};
+use vr_simulator::simulator::{Simulator, SimulatorConfig};
+use vr_simulator::types::NodeId;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +62,11 @@ struct CliConfig {
 
     #[arg(long, default_value_t = false)]
     disable_timers: bool,
+
+    /// Dump the run's typed history as JSON Lines (§12.0). Diff two dumps of
+    /// the same seed to check the determinism boundary by hand.
+    #[arg(long, value_name = "PATH")]
+    dump_trace: Option<std::path::PathBuf>,
 }
 
 enum Mode {
@@ -93,6 +91,13 @@ fn run_single_simulation(seed: u64, config: &CliConfig) {
     simulator.run();
 
     print_simulation_summary(seed, &simulator);
+
+    if let Some(path) = &config.dump_trace {
+        let mut file = std::fs::File::create(path).expect("failed to create trace file");
+        vr_simulator::history::dump_jsonl(&simulator.history, &mut file)
+            .expect("failed to write trace");
+        println!("trace dumped to {} ({} events)", path.display(), simulator.history.len());
+    }
 }
 
 fn run_max_samples_simulations(max_samples: u64, config: &CliConfig) {
@@ -124,7 +129,6 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
         simulator.add_client(*client_id, client);
     }
 
-    setup_links(&mut simulator, &replica_ids, &client_ids, config);
     start_seeded_workload(&mut simulator, &client_ids);
 
     simulator
@@ -150,41 +154,6 @@ fn replica_ids(count: u64) -> Vec<NodeId> {
 
 fn client_ids(count: u64) -> Vec<NodeId> {
     (0..count).map(NodeId).collect()
-}
-
-fn setup_links(
-    simulator: &mut Simulator<Op>,
-    replicas: &[NodeId],
-    clients: &[NodeId],
-    config: &CliConfig,
-) {
-    let link = Link {
-        up: true,
-        base_ms: config.link_base_ms,
-        jitter_ms: config.link_jitter_ms,
-        drop_pct: config.link_drop_pct,
-        dup_pct: config.link_dup_pct,
-    };
-
-    for (index, src) in replicas.iter().enumerate() {
-        for dst in replicas.iter().skip(index + 1) {
-            simulator.set_link(
-                NodeKind::Replica(*src),
-                NodeKind::Replica(*dst),
-                link.clone(),
-            );
-        }
-    }
-
-    for client in clients {
-        for replica in replicas {
-            simulator.set_link(
-                NodeKind::Client(*client),
-                NodeKind::Replica(*replica),
-                link.clone(),
-            );
-        }
-    }
 }
 
 fn start_seeded_workload(simulator: &mut Simulator<Op>, clients: &[NodeId]) {

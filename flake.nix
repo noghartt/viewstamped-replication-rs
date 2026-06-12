@@ -21,11 +21,11 @@
       devShells.default = pkgs.mkShell {
         name = "viewstamped-replication-rs";
 
-        buildInputs = with pkgs; [
-          darwin.apple_sdk.frameworks.SystemConfiguration
-          darwin.apple_sdk.frameworks.CoreServices
-          darwin.apple_sdk.frameworks.CoreFoundation
-        ];
+        # buildInputs = with pkgs; [
+        #   darwin.apple_sdk.frameworks.SystemConfiguration
+        #   darwin.apple_sdk.frameworks.CoreServices
+        #   darwin.apple_sdk.frameworks.CoreFoundation
+        # ];
 
         nativeBuildInputs = with pkgs; [
           (rust-bin.stable."1.85.0".default.override { extensions = [ "rust-src" "rust-analyzer" ]; } )

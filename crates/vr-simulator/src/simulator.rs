@@ -1,50 +1,32 @@
-use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
-use std::collections::{BTreeMap, VecDeque};
-use tracing::{debug, info};
+use std::collections::BTreeMap;
+use tracing::{debug, info, trace};
 
-use vr_replica::message::ClientRequest;
-use vr_replica::{effect::Effect, message::Message, replica::Replica};
+use vr_replica::effect::Effect;
+use vr_replica::message::{ClientRequest, Message};
+use vr_replica::replica::Replica;
 
 use crate::client::{Client, Op};
-use crate::events::Event;
+use crate::history::RuntimeEvent;
+use crate::network::{Network, NetworkSendOutcome};
+use crate::types::{NodeId, NodeKind};
 
-#[derive(Clone)]
-pub struct Links(pub BTreeMap<(NodeKind, NodeKind), Link>);
-
-#[cfg(test)]
-impl std::fmt::Debug for Links {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for ((a, b), l) in &self.0 {
-            writeln!(f, "{:?} -> {:?} -> {:?}\n", a, b, l)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NodeKind {
-    Client(NodeId),
-    Replica(NodeId),
-}
-
-#[derive(Debug, Clone)]
-pub struct Link {
-    pub up: bool,
-    pub base_ms: u64,
-    pub jitter_ms: u64,
-    pub drop_pct: u8,
-    pub dup_pct: u8,
-}
-
+/// The message rides IN the event: duplicating a message means scheduling the
+/// same cloned event twice, which is correct by construction. (The previous
+/// design — a Deliver token draining a shared inbox — made "duplicate" deliver
+/// two different messages.)
 #[derive(Debug)]
 enum WheelEvent<Input> {
-    Deliver(NodeKind),
-    ClientThink { client_id: NodeId, op: Input },
+    Deliver {
+        from: NodeKind,
+        to: NodeKind,
+        message: Message<Input, Op>,
+    },
+    ClientRequest {
+        client_id: NodeId,
+        op: Input,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -54,114 +36,107 @@ pub struct SimulatorConfig {
 }
 
 pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
+    config: SimulatorConfig,
+    seed: u64,
     pub now: u64,
     rng: ChaCha8Rng,
-    seed: u64,
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
+    network: Network,
 
     replicas: BTreeMap<NodeId, Replica<Input, Op>>,
-    inbox: BTreeMap<NodeKind, VecDeque<Event<Input>>>,
-    links: Links,
-
     clients: BTreeMap<NodeId, Client>,
 
-    config: SimulatorConfig,
+    /// Typed trace of the run (§10 Phase A). Source of truth for invariant
+    /// predicates and the JSONL dump — see `history.rs`.
+    pub history: Vec<RuntimeEvent<Input, Op>>,
 }
 
-impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
+impl Simulator<Op> {
     pub fn new(config: Option<SimulatorConfig>) -> Self {
         Self::with_seed(0, config)
     }
 
     pub fn with_seed(seed: u64, config: Option<SimulatorConfig>) -> Self {
-        let rng = ChaCha8Rng::seed_from_u64(seed);
-        info!(seed = seed, "Creating simulator with seed");
         Self {
-            rng,
             seed,
+            rng: ChaCha8Rng::seed_from_u64(seed),
             now: 0,
             wheel: BTreeMap::new(),
+            network: Network::new(),
             replicas: BTreeMap::new(),
-            inbox: BTreeMap::new(),
-            links: Links(BTreeMap::new()),
             clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
+            history: Vec::new(),
         }
+    }
+
+    fn record(&mut self, event: RuntimeEvent<Op, Op>) {
+        self.history.push(event);
+    }
+
+    /// Compact state snapshot after each batch of effects, so invariant
+    /// failures can show local replica state, not just messages in flight.
+    fn snapshot_replica(&mut self, node: NodeId) {
+        let Some(replica) = self.replicas.get(&node) else {
+            return;
+        };
+        let snapshot = RuntimeEvent::ReplicaSnapshot {
+            at: self.now,
+            node,
+            view: replica.view_number,
+            op_number: replica.op_number,
+            commit_number: replica.commit_number,
+            status: replica.status.clone(),
+            log: replica.log.clone(),
+        };
+        self.record(snapshot);
     }
 
     pub fn run(&mut self) {
-        self.run_until(self.config.run_until_max_time.unwrap_or(u64::MAX))
-    }
-
-    pub fn run_until(&mut self, max_time: u64) {
-        debug!(config = ?self.config, "running simulation",);
-        while let Some((&at, _)) = self.wheel.iter().next() {
-            if at > max_time {
-                break;
-            }
+        info!(seed = self.seed, "starting running simulation");
+        // Bounded: heartbeats (§3) will self-reschedule forever, so an
+        // unbounded drain becomes an infinite loop the day they land.
+        while !self.wheel.is_empty()
+            && self.config.run_until_max_time.is_none_or(|max| self.now < max)
+        {
             self.step()
         }
+    }
+
+    pub fn network_mut(&mut self) -> &mut Network {
+        &mut self.network
     }
 
     pub fn get_clients(&self) -> Vec<Client> {
         self.clients.values().cloned().collect()
     }
 
-    pub fn start_client_request(&mut self, client_id: NodeId, op: Input) -> bool {
-        if self.clients.get_mut(&client_id).is_none() {
+    pub fn start_client_request(&mut self, client_id: NodeId, op: Op) -> bool {
+        if !self.clients.contains_key(&client_id) {
             return false;
-        };
+        }
 
-        self.schedule(self.now, WheelEvent::ClientThink { client_id, op });
+        self.schedule_event(self.now, WheelEvent::ClientRequest { client_id, op });
 
         true
     }
 
-    pub fn add_replica(&mut self, id: NodeId, r: Replica<Input, Op>) {
-        // Only schedule timers based on replica role, and not immediately at time 0
-        let is_primary = r.view_number == r.replica_number;
-
+    pub fn add_replica(&mut self, id: NodeId, r: Replica<Op, Op>) {
         self.replicas.insert(id, r);
-        self.inbox.insert(NodeKind::Replica(id), VecDeque::new());
-
-        // Schedule initial timers with some delay to avoid immediate firing
-        if !self.config.disable_timers {
-            // let initial_delay = 100;
-            // if is_primary {
-            //     self.schedule(
-            //         self.now + initial_delay,
-            //         WheelEvent::FireTimer {
-            //             node: id,
-            //             kind: TimerKind::PrimaryIdleCommit,
-            //         },
-            //     );
-            // } else {
-            //     self.schedule(
-            //         self.now + initial_delay,
-            //         WheelEvent::FireTimer {
-            //             node: id,
-            //             kind: TimerKind::BackupWatchdog,
-            //         },
-            //     );
-            // }
-            todo!("Implement the disable timers configuration");
-        }
     }
 
     pub fn add_client(&mut self, id: NodeId, c: Client) {
         self.clients.insert(id, c);
-        self.inbox.insert(NodeKind::Client(id), VecDeque::new());
-    }
-
-    pub fn set_link(&mut self, src: NodeKind, dst: NodeKind, link: Link) {
-        self.links.0.insert((src, dst), link.clone());
-        self.links.0.insert((dst, src), link.clone());
     }
 
     pub fn step(&mut self) {
         let Some((&at, _)) = self.wheel.iter().next() else {
             return;
         };
+
+        // Time only moves forward: an event scheduled in the past is a
+        // harness bug (not a protocol bug), so it panics rather than drops.
+        assert!(at >= self.now, "wheel event at {at} is before now {}", self.now);
 
         let evs = self.wheel.remove(&at).unwrap();
         self.now = at;
@@ -170,130 +145,216 @@ impl<Input: Clone + std::fmt::Debug + 'static> Simulator<Input> {
 
         for ev in evs {
             match ev {
-                WheelEvent::Deliver(to) => self.deliver_one(to),
-                WheelEvent::ClientThink { client_id, op } => self.client_think(client_id, op),
+                WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message),
+                WheelEvent::ClientRequest { client_id, op } => {
+                    self.client_request(client_id, op)
+                }
             }
         }
     }
 
-    fn schedule(&mut self, at: u64, event: WheelEvent<Input>) {
-        self.wheel.entry(at).or_default().push(event);
-    }
-
-    fn deliver_one(&mut self, dst: NodeKind) {
-        match dst {
-            NodeKind::Replica(id) => self.deliver_to_replica(id),
-            NodeKind::Client(id) => self.deliver_to_client(id),
-        }
-    }
-
-    fn deliver_to_replica(&mut self, dst: NodeId) {
-        if let Some(q) = self.inbox.get_mut(&NodeKind::Replica(dst)) {
-            if let Some(ev) = q.pop_front() {
-                debug!(event = ?ev, destination = ?dst, "deliver to replica");
-                let r = self.replicas.get_mut(&dst).unwrap();
-                let mut effs = match ev {
-                    Event::Msg(m) => r.on_message(m.clone()),
+    fn deliver(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
+        debug!(now = self.now, ?from, ?to, ?message, "delivering message");
+        self.record(RuntimeEvent::MessageDelivered {
+            at: self.now,
+            to,
+            msg: message.clone(),
+        });
+        match to {
+            NodeKind::Replica(id) => {
+                let Some(replica) = self.replicas.get_mut(&id) else {
+                    debug!(?id, "message to unknown replica dropped");
+                    return;
                 };
-                debug!(destination = ?dst, effects = ?effs, "received effects from replicas");
-                self.apply_effects(dst, &mut effs);
+                let effects = replica.on_message(message);
+                self.apply_effects(to, effects);
+                self.snapshot_replica(id);
+            }
+            NodeKind::Client(id) => {
+                let Some(client) = self.clients.get_mut(&id) else {
+                    debug!(?id, "message to unknown client dropped");
+                    return;
+                };
+                if let Message::Reply {
+                    request_id, result, ..
+                } = &message
+                {
+                    let replied = RuntimeEvent::ClientReplied {
+                        at: self.now,
+                        client: id,
+                        request_number: *request_id as u64,
+                        result: result.clone(),
+                    };
+                    client.on_message(message);
+                    self.record(replied);
+                } else {
+                    client.on_message(message);
+                }
             }
         }
     }
 
-    fn deliver_to_client(&mut self, dst: NodeId) {
-        if let Some(q) = self.inbox.get_mut(&NodeKind::Client(dst)) {
-            if let Some(ev) = q.pop_front() {
-                let c = self.clients.get_mut(&dst).unwrap();
-                c.on_message(ev);
-            }
-        }
-    }
-
-    fn client_think(&mut self, client_id: NodeId, op: Input) {
+    fn client_request(&mut self, client_id: NodeId, op: Op) {
         let Some(client) = self.clients.get_mut(&client_id) else {
+            debug!(?client_id, "request for unknown client dropped");
             return;
         };
 
-        let request = Message::Request::<Input, Op>(ClientRequest {
-            client_id: client_id.0,
-            op,
-            // TODO: Fix the request_number here to not be a hardcoded one.
-            request_number: 0,
+        let request = ClientRequest {
+            op: op.clone(),
+            client_id: client.id.0,
+            request_number: client.request_number as usize,
             result: None,
+        };
+
+        let primary = client.believed_primary();
+        let request_number = client.request_number;
+        self.record(RuntimeEvent::ClientRequest {
+            at: self.now,
+            client: client_id,
+            request_number,
+            op,
         });
-
-        let current_primary = client.configuration[client.current_view as usize];
-        let replica_id = NodeId(current_primary);
-
-        debug!(destination = ?replica_id, primary = current_primary, req = ?request, "triggering client request");
-
         self.send(
             NodeKind::Client(client_id),
-            NodeKind::Replica(replica_id),
-            request,
+            NodeKind::Replica(NodeId(primary)),
+            Message::Request(request),
         );
     }
 
-    fn apply_effects(&mut self, from: NodeId, effs: &mut Vec<Effect<Input, Op>>) {
-        for eff in effs.drain(..) {
-            match eff {
+    fn apply_effects(&mut self, from: NodeKind, effects: Vec<Effect<Op, Op>>) {
+        for effect in effects {
+            match effect {
                 Effect::Send { to, message } => {
-                    let from_replica = NodeKind::Replica(from);
-                    let to_replica = NodeKind::Replica(NodeId(to));
-                    self.send(from_replica, to_replica, message);
+                    self.send(from, NodeKind::Replica(NodeId(to)), message)
                 }
                 Effect::Reply { client_id, message } => {
-                    assert!(matches!(message, Message::Reply { .. }));
-                    self.send(
-                        NodeKind::Replica(from),
-                        NodeKind::Client(NodeId(client_id)),
-                        message,
-                    );
+                    self.send(from, NodeKind::Client(NodeId(client_id)), message)
                 }
-                Effect::Committed { replica, op } => debug!(replica, op, "commited effect"),
-                Effect::RequestReceived { replica } => debug!(replica, "request received"),
-                Effect::Prepared { replica, op } => debug!(replica, op, "prepared"),
+                effect @ (Effect::RequestReceived { .. }
+                | Effect::Prepared { .. }
+                | Effect::Committed { .. }) => {
+                    trace!(now = self.now, ?from, ?effect, "lifecycle effect");
+                    self.record(RuntimeEvent::EffectEmitted {
+                        at: self.now,
+                        by: from,
+                        effect,
+                    });
+                }
             }
         }
     }
 
-    fn send(&mut self, from: NodeKind, to: NodeKind, m: Message<Input, Op>) {
-        let (up, base_ms, jitter_ms, drop_pct, dup_pct) = match self.links.0.get(&(from, to)) {
-            Some(l) => (l.up, l.base_ms, l.jitter_ms, l.drop_pct, l.dup_pct),
-            None => return,
-        };
-
-        if !up {
-            return;
+    fn send(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
+        match self.network.resolve_send(from, to, self.now, &mut self.rng) {
+            NetworkSendOutcome::Dropped => {
+                trace!(now = self.now, ?from, ?to, ?message, "message dropped");
+                self.record(RuntimeEvent::MessageDropped {
+                    at: self.now,
+                    from,
+                    to,
+                    msg: message,
+                });
+            }
+            NetworkSendOutcome::Delivered { at } => {
+                self.record(RuntimeEvent::MessageSent {
+                    at: self.now,
+                    from,
+                    to,
+                    msg: message.clone(),
+                });
+                self.schedule_event(at, WheelEvent::Deliver { from, to, message });
+            }
+            NetworkSendOutcome::Duplicated { at, duplicated_at } => {
+                trace!(now = self.now, ?from, ?to, ?message, "message duplicated");
+                self.record(RuntimeEvent::MessageSent {
+                    at: self.now,
+                    from,
+                    to,
+                    msg: message.clone(),
+                });
+                self.record(RuntimeEvent::MessageDuplicated {
+                    at: self.now,
+                    from,
+                    to,
+                    msg: message.clone(),
+                });
+                self.schedule_event(
+                    at,
+                    WheelEvent::Deliver {
+                        from,
+                        to,
+                        message: message.clone(),
+                    },
+                );
+                self.schedule_event(duplicated_at, WheelEvent::Deliver { from, to, message });
+            }
         }
+    }
 
-        if self.rng.random_range(0..100) < drop_pct {
-            debug!(from = ?from, to = ?to, "dropped");
-            return;
+    fn schedule_event(&mut self, at: u64, event: WheelEvent<Op>) {
+        self.wheel.entry(at).or_default().push(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    use vr_replica::state_machine::StateMachine;
+
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct KvState {
+        state: BTreeMap<String, u64>,
+    }
+
+    impl StateMachine for KvState {
+        type Input = Op;
+        type Output = Op;
+
+        fn apply(&mut self, input: Op) -> Op {
+            match input {
+                Op::Set(key, value) => {
+                    self.state.insert(key.clone(), value);
+                    Op::Set(key, value)
+                }
+                Op::Get(key, _) => {
+                    let value = self.state.get(&key).cloned();
+                    Op::Get(key, value)
+                }
+                Op::Del(key) => {
+                    self.state.remove(&key);
+                    Op::Del(key)
+                }
+            }
         }
+    }
 
-        let jitter = if jitter_ms == 0 {
-            0
-        } else {
-            self.rng.random_range(0..=jitter_ms)
-        };
-
-        let at = self.now + base_ms + jitter;
-
-        self.inbox
-            .get_mut(&to)
-            .unwrap()
-            .push_back(Event::Msg(m.clone()));
-
-        debug!(at = at, from = ?from, to = ?to, msg = ?m, "sending message");
-
-        self.schedule(at, WheelEvent::Deliver(to));
-        if self.rng.random_range(0..100) < dup_pct {
-            let dup_jitter = self.rng.random_range(0..=jitter_ms.max(1));
-            let at = self.now + base_ms + dup_jitter;
-            debug!(at = at, from = ?from, to = ?to, "duplicated message");
-            self.schedule(at, WheelEvent::Deliver(to))
+    fn setup(seed: u64, replicas: u64) -> Simulator<Op> {
+        let mut sim = Simulator::with_seed(seed, None);
+        let configuration: Vec<u64> = (0..replicas).collect();
+        for id in 0..replicas {
+            let sm = Rc::new(RefCell::new(KvState::default()));
+            sim.add_replica(NodeId(id), Replica::new(configuration.clone(), id, sm));
         }
+        sim.add_client(NodeId(0), Client::new(NodeId(0), configuration));
+        sim
+    }
+
+    /// §10 A0.11 smoke test: 3 replicas, 1 client, 1 op, no faults →
+    /// exactly one reply received.
+    #[test]
+    fn smoke_one_request_one_reply() {
+        let mut sim = setup(42, 3);
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+        sim.run();
+
+        let client = &sim.get_clients()[0];
+        assert_eq!(client.replies_received, 1, "client state: {:?}", client);
+        assert_eq!(client.state.get("k"), Some(&7));
     }
 }
