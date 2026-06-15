@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
-use crate::types::NodeKind;
+use crate::types::{Clients, NodeId, NodeKind, Replicas};
 
 #[derive(Debug, Clone)]
 pub struct Link {
@@ -34,6 +34,15 @@ pub enum NetworkSendOutcome {
     Duplicated { at: u64, duplicated_at: u64 },
 }
 
+// (2026-06-15) NOTE: I do think there's a specific wrong modelling with this Network structure.
+// In case, from what I thought: I'm not sure if the `drop_probability` or `duplication_probability`
+// should be part of the network structure per se.
+//
+// Why? Because not all payloads and events coming through the Network means to be duplicated.
+// It can happen once, for a single, exclusive event. So ideally, I think we should have some
+// way to model the network to represent scenarios like this one too. Not a static scenario,
+// where the probability always still the same.
+#[derive(Debug)]
 pub struct Network {
     /// Links of communication nodes. This represents the properties of a given
     /// message bus between two connected nodes.
@@ -51,6 +60,52 @@ impl Network {
         Self {
             links: BTreeMap::new(),
         }
+    }
+
+    pub fn full_mesh<Input: std::fmt::Debug + Clone, Output: std::fmt::Debug + Clone>(
+        rng: &mut ChaCha8Rng,
+        replicas: Replicas<Input, Output>,
+        clients: Clients,
+    ) -> Self {
+        let mut network = Self::new();
+
+        replicas.iter().for_each(|replica| {
+            let replica_id = replica.0;
+            let other_replicas: Vec<&NodeId> = replicas
+                .iter()
+                .filter(|r| r.0 != replica_id)
+                .map(|r| r.0)
+                .collect();
+
+            other_replicas.iter().for_each(|r| {
+                let key_a = NodeKind::Replica(*replica_id);
+                let key_b = NodeKind::Replica(**r);
+
+                let has_network = network.links.get(&(key_a, key_b));
+                if has_network.is_some() {
+                    return;
+                }
+
+                network.set_link(key_a, key_b, Network::create_rng_link(rng));
+                network.set_link(key_b, key_a, Network::create_rng_link(rng));
+            })
+        });
+
+        // (2026-06-05) NOTE: Right now, I've built the network considering that
+        // every client does have a "wire" access into every replica. I'm still
+        // not sure if ideally the link should be considering only the primary replica
+        // instead.
+        clients.iter().for_each(|c| {
+            replicas.iter().for_each(|r| {
+                let client_id = NodeKind::Client(*c.0);
+                let replica_id = NodeKind::Replica(*r.0);
+
+                network.set_link(client_id, replica_id, Network::create_rng_link(rng));
+                network.set_link(replica_id, client_id, Network::create_rng_link(rng));
+            })
+        });
+
+        network
     }
 
     pub fn set_link(&mut self, from: NodeKind, to: NodeKind, link: Link) {
@@ -110,5 +165,16 @@ impl Network {
             return 0;
         }
         rng.random_range(0..=link.jitter_ms)
+    }
+
+    // TODO: See a better way to handle the magic numbers.
+    fn create_rng_link(rng: &mut ChaCha8Rng) -> Link {
+        Link {
+            partitioned: false,
+            base_ms: rng.random_range(10..120),
+            jitter_ms: rng.random_range(0..80),
+            drop_probability: rng.random_range(0..30),
+            duplication_probability: rng.random_range(0..50),
+        }
     }
 }

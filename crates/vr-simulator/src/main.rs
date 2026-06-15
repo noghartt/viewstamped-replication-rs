@@ -44,6 +44,7 @@ struct Modes {
     max_samples: Option<u64>,
 }
 
+// TODO: Fix the CLI configs to match the SimulatorConfig implementation.
 #[derive(Args, Clone, Debug)]
 struct CliConfig {
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
@@ -90,6 +91,7 @@ fn main() {
 
 fn run_single_simulation(seed: u64, config: &CliConfig) {
     let mut simulator = setup_simulation(seed, config);
+    println!("{:?}", simulator);
     simulator.run();
 
     print_simulation_summary(seed, &simulator);
@@ -123,6 +125,8 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
         let client = Client::new(*client_id, replica_configuration.clone());
         simulator.add_client(*client_id, client);
     }
+
+    simulator.create_network_mesh();
 
     start_seeded_workload(&mut simulator, &client_ids);
 

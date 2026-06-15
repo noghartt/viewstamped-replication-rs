@@ -9,7 +9,7 @@ use vr_replica::replica::Replica;
 
 use crate::client::{Client, Op};
 use crate::network::{Network, NetworkSendOutcome};
-use crate::types::{NodeId, NodeKind};
+use crate::types::{Clients, NodeId, NodeKind, Replicas};
 
 /// The message rides IN the event: duplicating a message means scheduling the
 /// same cloned event twice, which is correct by construction. (The previous
@@ -34,6 +34,7 @@ pub struct SimulatorConfig {
     pub run_until_max_time: Option<u64>,
 }
 
+#[derive(Debug)]
 pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     config: SimulatorConfig,
     seed: u64,
@@ -42,8 +43,8 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
     network: Network,
 
-    replicas: BTreeMap<NodeId, Replica<Input, Op>>,
-    clients: BTreeMap<NodeId, Client>,
+    replicas: Replicas<Input, Op>,
+    clients: Clients,
 }
 
 impl Simulator<Op> {
@@ -66,17 +67,15 @@ impl Simulator<Op> {
 
     pub fn run(&mut self) {
         info!(seed = self.seed, "starting running simulation");
-        // Bounded: heartbeats (§3) will self-reschedule forever, so an
-        // unbounded drain becomes an infinite loop the day they land.
+        // TODO: Handle scenarios like tick/heartbeart to avoid infinite loops for each simulation.
         while !self.wheel.is_empty()
-            && self.config.run_until_max_time.is_none_or(|max| self.now < max)
+            && self
+                .config
+                .run_until_max_time
+                .is_none_or(|max| self.now < max)
         {
             self.step()
         }
-    }
-
-    pub fn network_mut(&mut self) -> &mut Network {
-        &mut self.network
     }
 
     pub fn get_clients(&self) -> Vec<Client> {
@@ -101,6 +100,16 @@ impl Simulator<Op> {
         self.clients.insert(id, c);
     }
 
+    pub fn create_network_mesh(&mut self) {
+        let network = Network::full_mesh::<Op, Op>(
+            &mut self.rng,
+            self.replicas.clone(),
+            self.clients.clone(),
+        );
+
+        self.network = network;
+    }
+
     pub fn step(&mut self) {
         let Some((&at, _)) = self.wheel.iter().next() else {
             return;
@@ -108,7 +117,11 @@ impl Simulator<Op> {
 
         // Time only moves forward: an event scheduled in the past is a
         // harness bug (not a protocol bug), so it panics rather than drops.
-        assert!(at >= self.now, "wheel event at {at} is before now {}", self.now);
+        assert!(
+            at >= self.now,
+            "wheel event at {at} is before now {}",
+            self.now
+        );
 
         let evs = self.wheel.remove(&at).unwrap();
         self.now = at;
@@ -118,9 +131,7 @@ impl Simulator<Op> {
         for ev in evs {
             match ev {
                 WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message),
-                WheelEvent::ClientRequest { client_id, op } => {
-                    self.client_request(client_id, op)
-                }
+                WheelEvent::ClientRequest { client_id, op } => self.client_request(client_id, op),
             }
         }
     }
@@ -263,8 +274,6 @@ mod tests {
         sim
     }
 
-    /// §10 A0.11 smoke test: 3 replicas, 1 client, 1 op, no faults →
-    /// exactly one reply received.
     #[test]
     fn smoke_one_request_one_reply() {
         let mut sim = setup(42, 3);
