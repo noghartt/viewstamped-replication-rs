@@ -178,7 +178,7 @@ fn print_simulation_summary(seed: u64, simulator: &Simulator<Op>, log_history: b
     }
 
     if log_history {
-        println!("{:?}", simulator.history);
+        println!("{}", simulator.history);
     }
 }
 

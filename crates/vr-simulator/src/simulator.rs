@@ -205,34 +205,40 @@ impl Simulator<Op> {
         match self.network.resolve_send(from, to, self.now, &mut self.rng) {
             NetworkSendOutcome::Dropped => {
                 trace!(now = self.now, ?from, ?to, ?message, "message dropped");
-                self.history
-                    .insert_history_event(RuntimeEvents::NetworkRequest {
+                self.history.insert_history_event(
+                    self.now,
+                    RuntimeEvents::NetworkRequest {
                         from,
                         to,
                         outcome: NetworkSendOutcome::Dropped,
                         message,
-                    });
+                    },
+                );
             }
             NetworkSendOutcome::Delivered { at } => {
-                self.history
-                    .insert_history_event(RuntimeEvents::NetworkRequest {
+                self.history.insert_history_event(
+                    self.now,
+                    RuntimeEvents::NetworkRequest {
                         from,
                         to,
                         outcome: NetworkSendOutcome::Delivered { at },
                         message: message.clone(),
-                    });
+                    },
+                );
                 self.schedule_event(at, WheelEvent::Deliver { from, to, message });
             }
             NetworkSendOutcome::Duplicated { at, duplicated_at } => {
                 trace!(now = self.now, ?from, ?to, ?message, "message duplicated");
 
-                self.history
-                    .insert_history_event(RuntimeEvents::NetworkRequest {
+                self.history.insert_history_event(
+                    self.now,
+                    RuntimeEvents::NetworkRequest {
                         from,
                         to,
                         outcome: NetworkSendOutcome::Duplicated { at, duplicated_at },
                         message: message.clone(),
-                    });
+                    },
+                );
 
                 self.schedule_event(
                     at,
