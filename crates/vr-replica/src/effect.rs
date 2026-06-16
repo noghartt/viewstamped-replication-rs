@@ -11,9 +11,6 @@ pub enum Effect<I, O> {
         client_id: u64,
         message: Message<I, O>,
     },
-    RequestReceived {
-        replica: ReplicaId,
-    },
     Committed {
         replica: ReplicaId,
         op: OpNumber,

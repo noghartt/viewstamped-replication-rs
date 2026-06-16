@@ -192,10 +192,12 @@ impl Simulator<Op> {
                 }
                 // Lifecycle effects become history records in §10 Phase A;
                 // until the recorder exists they are trace-only.
-                Effect::RequestReceived { .. }
-                | Effect::Prepared { .. }
-                | Effect::Committed { .. } => {
-                    trace!(now = self.now, ?from, ?effect, "lifecycle effect");
+                Effect::Committed { replica, .. } | Effect::Prepared { replica, .. } => {
+                    trace!(at = self.now, replica = replica, "lifecycle events");
+                    self.history.insert_history_event(
+                        self.now,
+                        RuntimeEvents::ReplicaOperation { replica, effect },
+                    );
                 }
             }
         }
