@@ -18,6 +18,11 @@ pub enum RuntimeEvents<
         outcome: NetworkSendOutcome,
         message: Message<Input, Output>,
     },
+    NetworkDelivered {
+        from: NodeKind,
+        to: NodeKind,
+        message: Message<Input, Output>,
+    },
     ReplicaOperation {
         replica: ReplicaId,
         effect: Effect<Input, Output>,
@@ -127,6 +132,16 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                         node_tag(to),
                         message_label(message),
                         outcome_label(outcome),
+                    )?;
+                }
+
+                RuntimeEvents::NetworkDelivered { from, to, message } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]  {:>3} ══▶ {:<3}  {:<32}  ✓ delivered",
+                        node_tag(from),
+                        node_tag(to),
+                        message_label(message),
                     )?;
                 }
 

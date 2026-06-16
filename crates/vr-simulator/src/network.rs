@@ -152,6 +152,16 @@ impl Network {
 
         let at = now + link.base_ms + Self::jitter(&link, rng);
 
+        // TODO: Duplication is capped at exactly 2 copies — an artifact of a
+        // single roll, not a modeling decision. Make it recursive instead: each
+        // delivered copy re-rolls "spawn another?" (re-rolling duplication +
+        // fresh jitter only, NOT drop), giving a geometric distribution of copy
+        // count. This collapses `NetworkSendOutcome::Duplicated` away — a
+        // duplicate becomes just another `Delivered` — and turns the dup branch
+        // in `Simulator::send` into a loop with no copy-pasted scheduling.
+        // Add a safety cap (~8 copies) so a high-probability seed can't flood.
+        // Determinism is preserved: variable draw *count* is fine, only the
+        // draw *sequence* must stay deterministic.
         if rng.random_range(0..100) < link.duplication_probability {
             let duplicated_at = now + link.base_ms + Self::jitter(&link, rng);
             return NetworkSendOutcome::Duplicated { at, duplicated_at };

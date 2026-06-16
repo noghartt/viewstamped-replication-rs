@@ -141,6 +141,20 @@ impl Simulator<Op> {
 
     fn deliver(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
         debug!(now = self.now, ?from, ?to, ?message, "delivering message");
+
+        // The send-time NetworkRequest records the *decision* to deliver (with
+        // its future `at`); this records the message actually arriving, so a
+        // trace shows both ends of every hop. A dropped message has no
+        // NetworkDelivered; a duplicated one has two.
+        self.history.insert_history_event(
+            self.now,
+            RuntimeEvents::NetworkDelivered {
+                from,
+                to,
+                message: message.clone(),
+            },
+        );
+
         match to {
             NodeKind::Replica(id) => {
                 let Some(replica) = self.replicas.get_mut(&id) else {
