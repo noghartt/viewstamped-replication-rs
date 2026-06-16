@@ -5,6 +5,7 @@ use std::{cell::RefCell, rc::Rc};
 use clap::{Args, Parser};
 
 mod client;
+mod history;
 mod network;
 mod simulator;
 mod types;
@@ -70,6 +71,9 @@ struct CliConfig {
 
     #[arg(long, default_value_t = false)]
     disable_timers: bool,
+
+    #[arg(long, default_value_t = false)]
+    history: bool,
 }
 
 enum Mode {
@@ -91,10 +95,9 @@ fn main() {
 
 fn run_single_simulation(seed: u64, config: &CliConfig) {
     let mut simulator = setup_simulation(seed, config);
-    println!("{:?}", simulator);
     simulator.run();
 
-    print_simulation_summary(seed, &simulator);
+    print_simulation_summary(seed, &simulator, config.history);
 }
 
 fn run_max_samples_simulations(max_samples: u64, config: &CliConfig) {
@@ -167,11 +170,15 @@ fn start_seeded_workload(simulator: &mut Simulator<Op>, clients: &[NodeId]) {
     }
 }
 
-fn print_simulation_summary(seed: u64, simulator: &Simulator<Op>) {
+fn print_simulation_summary(seed: u64, simulator: &Simulator<Op>, log_history: bool) {
     println!("finished simulation seed={seed} now={}", simulator.now);
 
     for client in simulator.get_clients() {
         println!("client={} state={:?}", client.id.0, client.state);
+    }
+
+    if log_history {
+        println!("{:?}", simulator.history);
     }
 }
 

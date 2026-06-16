@@ -8,6 +8,7 @@ use vr_replica::message::{ClientRequest, Message};
 use vr_replica::replica::Replica;
 
 use crate::client::{Client, Op};
+use crate::history::{History, RuntimeEvents};
 use crate::network::{Network, NetworkSendOutcome};
 use crate::types::{Clients, NodeId, NodeKind, Replicas};
 
@@ -42,6 +43,7 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     rng: ChaCha8Rng,
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
     network: Network,
+    pub history: History<Input, Op>,
 
     replicas: Replicas<Input, Op>,
     clients: Clients,
@@ -59,6 +61,7 @@ impl Simulator<Op> {
             now: 0,
             wheel: BTreeMap::new(),
             network: Network::new(),
+            history: History::new(),
             replicas: BTreeMap::new(),
             clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
@@ -67,7 +70,7 @@ impl Simulator<Op> {
 
     pub fn run(&mut self) {
         info!(seed = self.seed, "starting running simulation");
-        // TODO: Handle scenarios like tick/heartbeart to avoid infinite loops for each simulation.
+        // TODO: Handle scenarios like tick/heartbeat to avoid infinite loops for each simulation.
         while !self.wheel.is_empty()
             && self
                 .config
@@ -75,6 +78,32 @@ impl Simulator<Op> {
                 .is_none_or(|max| self.now < max)
         {
             self.step()
+        }
+    }
+
+    fn step(&mut self) {
+        let Some((&at, _)) = self.wheel.iter().next() else {
+            return;
+        };
+
+        // Time only moves forward: an event scheduled in the past is a
+        // harness bug (not a protocol bug), so it panics rather than drops.
+        assert!(
+            at >= self.now,
+            "wheel event at {at} is before now {}",
+            self.now
+        );
+
+        let evs = self.wheel.remove(&at).unwrap();
+        self.now = at;
+
+        debug!(now = self.now, events = ?evs, "triggering step");
+
+        for ev in evs {
+            match ev {
+                WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message),
+                WheelEvent::ClientRequest { client_id, op } => self.client_request(client_id, op),
+            }
         }
     }
 
@@ -108,32 +137,6 @@ impl Simulator<Op> {
         );
 
         self.network = network;
-    }
-
-    pub fn step(&mut self) {
-        let Some((&at, _)) = self.wheel.iter().next() else {
-            return;
-        };
-
-        // Time only moves forward: an event scheduled in the past is a
-        // harness bug (not a protocol bug), so it panics rather than drops.
-        assert!(
-            at >= self.now,
-            "wheel event at {at} is before now {}",
-            self.now
-        );
-
-        let evs = self.wheel.remove(&at).unwrap();
-        self.now = at;
-
-        debug!(now = self.now, events = ?evs, "triggering step");
-
-        for ev in evs {
-            match ev {
-                WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message),
-                WheelEvent::ClientRequest { client_id, op } => self.client_request(client_id, op),
-            }
-        }
     }
 
     fn deliver(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
@@ -202,12 +205,35 @@ impl Simulator<Op> {
         match self.network.resolve_send(from, to, self.now, &mut self.rng) {
             NetworkSendOutcome::Dropped => {
                 trace!(now = self.now, ?from, ?to, ?message, "message dropped");
+                self.history
+                    .insert_history_event(RuntimeEvents::NetworkRequest {
+                        from,
+                        to,
+                        outcome: NetworkSendOutcome::Dropped,
+                        message,
+                    });
             }
             NetworkSendOutcome::Delivered { at } => {
+                self.history
+                    .insert_history_event(RuntimeEvents::NetworkRequest {
+                        from,
+                        to,
+                        outcome: NetworkSendOutcome::Delivered { at },
+                        message: message.clone(),
+                    });
                 self.schedule_event(at, WheelEvent::Deliver { from, to, message });
             }
             NetworkSendOutcome::Duplicated { at, duplicated_at } => {
                 trace!(now = self.now, ?from, ?to, ?message, "message duplicated");
+
+                self.history
+                    .insert_history_event(RuntimeEvents::NetworkRequest {
+                        from,
+                        to,
+                        outcome: NetworkSendOutcome::Duplicated { at, duplicated_at },
+                        message: message.clone(),
+                    });
+
                 self.schedule_event(
                     at,
                     WheelEvent::Deliver {
