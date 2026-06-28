@@ -343,15 +343,17 @@ mod tests {
     fn same_seed_same_history() {
         let h1 = {
             let mut s = setup(42, 3);
-            s.create_network_perfect_mesh();
-            s.start_client_request(NodeId(0), Op::Set("k".into(), 7)); s.run();
+            s.create_network_mesh();
+            s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+            s.run();
             s.history
         };
 
         let h2 = {
             let mut s = setup(42, 3);
-            s.create_network_perfect_mesh();
-            s.start_client_request(NodeId(0), Op::Set("k".into(), 7)); s.run();
+            s.create_network_mesh();
+            s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+            s.run();
             s.history
         };
 
