@@ -34,6 +34,12 @@ pub enum NetworkSendOutcome {
     Duplicated { at: u64, duplicated_at: u64 },
 }
 
+impl Link {
+    fn perfect_link() -> Link {
+        Self { partitioned: false, base_ms: 1, jitter_ms: 0, drop_probability: 0, duplication_probability: 0 }
+    }
+}
+
 // (2026-06-15) NOTE: I do think there's a specific wrong modelling with this Network structure.
 // In case, from what I thought: I'm not sure if the `drop_probability` or `duplication_probability`
 // should be part of the network structure per se.
@@ -102,6 +108,47 @@ impl Network {
 
                 network.set_link(client_id, replica_id, Network::create_rng_link(rng));
                 network.set_link(replica_id, client_id, Network::create_rng_link(rng));
+            })
+        });
+
+        network
+    }
+
+    pub fn full_mesh_perfect<Input: std::fmt::Debug + Clone, Output: std::fmt::Debug + Clone>(
+        replicas: Replicas<Input, Output>,
+        clients: Clients,
+    ) -> Self {
+        let mut network = Self::new();
+
+        replicas.iter().for_each(|replica| {
+            let replica_id = replica.0;
+            let other_replicas: Vec<&NodeId> = replicas
+                .iter()
+                .filter(|r| r.0 != replica_id)
+                .map(|r| r.0)
+                .collect();
+
+            other_replicas.iter().for_each(|r| {
+                let key_a = NodeKind::Replica(*replica_id);
+                let key_b = NodeKind::Replica(**r);
+
+                let has_network = network.links.get(&(key_a, key_b));
+                if has_network.is_some() {
+                    return;
+                }
+
+                network.set_link(key_a, key_b, Link::perfect_link());
+                network.set_link(key_b, key_a, Link::perfect_link());
+            })
+        });
+
+        clients.iter().for_each(|c| {
+            replicas.iter().for_each(|r| {
+                let client_id = NodeKind::Client(*c.0);
+                let replica_id = NodeKind::Replica(*r.0);
+
+                network.set_link(client_id, replica_id, Link::perfect_link());
+                network.set_link(replica_id, client_id, Link::perfect_link());
             })
         });
 

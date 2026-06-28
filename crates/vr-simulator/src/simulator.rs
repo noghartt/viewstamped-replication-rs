@@ -139,6 +139,11 @@ impl Simulator<Op> {
         self.network = network;
     }
 
+    pub fn create_network_perfect_mesh(&mut self) {
+        let network = Network::full_mesh_perfect(self.replicas.clone(), self.clients.clone());
+        self.network = network;
+    }
+
     fn deliver(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
         debug!(now = self.now, ?from, ?to, ?message, "delivering message");
 
@@ -293,7 +298,7 @@ mod tests {
         type Input = Op;
         type Output = Op;
 
-        fn apply(&mut self, input: Op) -> Op {
+        fn apply(&mut self, input: Self::Input) -> Self::Output {
             match input {
                 Op::Set(key, value) => {
                     self.state.insert(key.clone(), value);
@@ -325,6 +330,7 @@ mod tests {
     #[test]
     fn smoke_one_request_one_reply() {
         let mut sim = setup(42, 3);
+        sim.create_network_perfect_mesh();
         assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
         sim.run();
 
