@@ -40,7 +40,7 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     config: SimulatorConfig,
     seed: u64,
     pub now: u64,
-    rng: ChaCha8Rng,
+    pub rng: ChaCha8Rng,
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
     network: Network,
     pub history: History<Input, Op>,

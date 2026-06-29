@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::rc::Rc;
 
@@ -27,17 +27,17 @@ where
     pub replica_number: ReplicaId,
 
     pub epoch: u64,
-    pub view_number: ReplicaId,
+    view_number: ReplicaId,
     pub status: Status,
 
-    pub op_number: usize,
-    pub commit_number: usize,
-    pub log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
+    op_number: usize,
+    commit_number: usize,
+    log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
     client_table: BTreeMap<u64, ClientRequest<Input, Output>>,
 
-    pub op_ack_table: BTreeMap<OpNumber, Vec<ReplicaId>>,
+    op_ack_table: BTreeMap<OpNumber, BTreeSet<ReplicaId>>,
 
-    pub state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
+    state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
 }
 
 impl<Input, Output> Replica<Input, Output>
@@ -199,10 +199,10 @@ where
         self.op_ack_table
             .entry(op_number)
             .or_default()
-            .push(replica_number);
+            .insert(replica_number);
 
         let quorum = self.get_quorum();
-        if self.op_ack_table.get(&op_number).unwrap_or(&vec![]).len() < quorum {
+        if self.op_ack_table.get(&op_number).map_or(0, |s| s.len()) < quorum {
             return vec![];
         }
 
