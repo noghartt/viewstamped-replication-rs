@@ -9,6 +9,7 @@ use vr_replica::replica::Replica;
 
 use crate::client::{Client, Op};
 use crate::history::{History, RuntimeEvents};
+use crate::invariants::{InvariantViolation, StateChecker};
 use crate::network::{Network, NetworkSendOutcome};
 use crate::types::{Clients, NodeId, NodeKind, Replicas};
 
@@ -44,6 +45,7 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
     network: Network,
     pub history: History<Input, Op>,
+    checker: StateChecker,
 
     replicas: Replicas<Input, Op>,
     clients: Clients,
@@ -65,10 +67,11 @@ impl Simulator<Op> {
             replicas: BTreeMap::new(),
             clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
+            checker: StateChecker::new(),
         }
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> Result<(), InvariantViolation> {
         info!(seed = self.seed, "starting running simulation");
         // TODO: Handle scenarios like tick/heartbeat to avoid infinite loops for each simulation.
         while !self.wheel.is_empty()
@@ -77,13 +80,16 @@ impl Simulator<Op> {
                 .run_until_max_time
                 .is_none_or(|max| self.now < max)
         {
-            self.step()
+            self.step()?;
         }
+
+        Ok(())
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> Result<(), InvariantViolation> {
         let Some((&at, _)) = self.wheel.iter().next() else {
-            return;
+            // Returning success, because no more items here to iterate through the wheel.
+            return Ok(());
         };
 
         // Time only moves forward: an event scheduled in the past is a
@@ -101,10 +107,16 @@ impl Simulator<Op> {
 
         for ev in evs {
             match ev {
-                WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message),
-                WheelEvent::ClientRequest { client_id, op } => self.client_request(client_id, op),
+                WheelEvent::Deliver { from, to, message } => {
+                    self.deliver(from, to, message)?;
+                }
+                WheelEvent::ClientRequest { client_id, op } => {
+                    self.client_request(client_id, op);
+                }
             }
         }
+
+        Ok(())
     }
 
     pub fn get_clients(&self) -> Vec<Client> {
@@ -144,7 +156,12 @@ impl Simulator<Op> {
         self.network = network;
     }
 
-    fn deliver(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
+    fn deliver(
+        &mut self,
+        from: NodeKind,
+        to: NodeKind,
+        message: Message<Op, Op>,
+    ) -> Result<(), InvariantViolation> {
         debug!(now = self.now, ?from, ?to, ?message, "delivering message");
 
         // The send-time NetworkRequest records the *decision* to deliver (with
@@ -165,7 +182,12 @@ impl Simulator<Op> {
                 let (effects, snapshot) = {
                     let Some(replica) = self.replicas.get_mut(&id) else {
                         debug!(?id, "message to unknown replica dropped");
-                        return;
+                        return Err(InvariantViolation {
+                            invariant: "unknown_replica",
+                            // TODO: Fix this to follow NodeId pattern too.
+                            replica: id.0,
+                            details: String::from("Attempt to sent to unnown replica ID"),
+                        });
                     };
 
                     let effects = replica.on_message(message);
@@ -174,19 +196,27 @@ impl Simulator<Op> {
                     (effects, snapshot)
                 };
 
+                self.checker.observe_snapshot(snapshot.clone());
                 self.history
                     .insert_history_event(self.now, RuntimeEvents::ReplicaSnapshot { snapshot });
 
-                self.apply_effects(to, effects);
+                self.apply_effects(to, effects)?;
             }
             NodeKind::Client(id) => {
                 let Some(client) = self.clients.get_mut(&id) else {
                     debug!(?id, "message to unknown client dropped");
-                    return;
+                    return Err(InvariantViolation {
+                        invariant: "unknown_replica",
+                        // TODO: Fix this to follow NodeId pattern too.
+                        replica: id.0,
+                        details: String::from("Attempt to sent to unnown replica ID"),
+                    });
                 };
                 client.on_message(message);
             }
         }
+
+        Ok(())
     }
 
     fn client_request(&mut self, client_id: NodeId, op: Op) {
@@ -210,14 +240,34 @@ impl Simulator<Op> {
         );
     }
 
-    fn apply_effects(&mut self, from: NodeKind, effects: Vec<Effect<Op, Op>>) {
+    fn apply_effects(
+        &mut self,
+        from: NodeKind,
+        effects: Vec<Effect<Op, Op>>,
+    ) -> Result<(), InvariantViolation> {
         for effect in effects {
             match effect {
                 Effect::Send { to, message } => {
                     self.send(from, NodeKind::Replica(NodeId(to)), message)
                 }
                 Effect::Reply { client_id, message } => {
-                    self.send(from, NodeKind::Client(NodeId(client_id)), message)
+                    if let (
+                        NodeKind::Replica(replica_id),
+                        Message::Reply {
+                            client_id,
+                            request_id,
+                            ..
+                        },
+                    ) = (from, &message)
+                    {
+                        self.checker.invariant_reply_implies_committed(
+                            replica_id.0,
+                            *client_id,
+                            *request_id,
+                        )?;
+                    }
+
+                    self.send(from, NodeKind::Client(NodeId(client_id)), message);
                 }
                 // Lifecycle effects become history records in §10 Phase A;
                 // until the recorder exists they are trace-only.
@@ -230,6 +280,8 @@ impl Simulator<Op> {
                 }
             }
         }
+
+        Ok(())
     }
 
     fn send(&mut self, from: NodeKind, to: NodeKind, message: Message<Op, Op>) {
@@ -338,24 +390,12 @@ mod tests {
     }
 
     #[test]
-    fn smoke_one_request_one_reply() {
-        let mut sim = setup(42, 3);
-        sim.create_network_perfect_mesh();
-        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
-        sim.run();
-
-        let client = &sim.get_clients()[0];
-        assert_eq!(client.replies_received, 1, "client state: {:?}", client);
-        assert_eq!(client.state.get("k"), Some(&7));
-    }
-
-    #[test]
     fn same_seed_same_history() {
         let h1 = {
             let mut s = setup(42, 3);
             s.create_network_mesh();
             s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-            s.run();
+            s.run().unwrap();
             s.history
         };
 
@@ -363,7 +403,7 @@ mod tests {
             let mut s = setup(42, 3);
             s.create_network_mesh();
             s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-            s.run();
+            s.run().unwrap();
             s.history
         };
 
@@ -375,7 +415,7 @@ mod tests {
         let mut sim = setup(42, 3);
         sim.create_network_perfect_mesh();
         sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-        sim.run();
+        sim.run().unwrap_err();
 
         assert!(sim.history.events().iter().any(|(_, event)| {
             matches!(
@@ -386,5 +426,17 @@ mod tests {
                         && snapshot.log.len() == 1
             )
         }));
+    }
+
+    #[test]
+    fn catches_reply_for_uncommitted_operation() {
+        let mut sim = setup(42, 3);
+        sim.create_network_perfect_mesh();
+        sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+
+        let violation = sim.run().unwrap_err();
+
+        assert_eq!(violation.invariant, "reply_implies_committed");
+        assert_eq!(violation.replica, 0);
     }
 }

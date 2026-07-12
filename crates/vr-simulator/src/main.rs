@@ -6,6 +6,7 @@ use clap::{Args, Parser};
 
 mod client;
 mod history;
+mod invariants;
 mod network;
 mod simulator;
 mod types;
@@ -16,6 +17,7 @@ use types::NodeId;
 use vr_replica::{replica::Replica, state_machine::StateMachine};
 
 use crate::client::{Client, Op};
+use crate::invariants::InvariantViolation;
 use crate::simulator::SimulatorConfig;
 
 #[derive(Parser, Debug)]
@@ -82,30 +84,57 @@ enum Mode {
     MaxSamples(u64),
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     init_tracing();
 
     let args = Cli::parse();
 
     let mode = get_mode(args.modes);
-    match mode {
+    let result = match mode {
         Mode::Single(seed) => run_single_simulation(seed, &args.config),
         Mode::MaxSamples(max_samples) => run_max_samples_simulations(max_samples, &args.config),
+    };
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(_) => std::process::ExitCode::FAILURE,
     }
 }
 
-fn run_single_simulation(seed: u64, config: &CliConfig) {
+fn run_single_simulation(seed: u64, config: &CliConfig) -> Result<(), InvariantViolation> {
     let mut simulator = setup_simulation(seed, config);
-    simulator.run();
+    match simulator.run() {
+        Ok(()) => {
+            print_simulation_summary(seed, &simulator, config.history);
+            Ok(())
+        }
+        Err(violation) => {
+            eprintln!("simulation failed");
+            eprintln!("seed={seed}");
+            eprintln!("invariant={}", violation.invariant);
+            eprintln!("replica={}", violation.replica);
+            eprintln!("details={}", violation.details);
+            eprintln!();
+            eprintln!("{}", simulator.history);
 
-    print_simulation_summary(seed, &simulator, config.history);
+            Err(violation)
+        }
+    }
 }
 
-fn run_max_samples_simulations(max_samples: u64, config: &CliConfig) {
-    for _ in 0..max_samples {
+fn run_max_samples_simulations(
+    max_samples: u64,
+    config: &CliConfig,
+) -> Result<(), InvariantViolation> {
+    for sample in 0..max_samples {
         let seed = rand::random();
-        run_single_simulation(seed, config);
+
+        println!("running sample={}/{} seed={seed}", sample + 1, max_samples);
+
+        run_single_simulation(seed, config)?;
     }
+
+    Ok(())
 }
 
 fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
