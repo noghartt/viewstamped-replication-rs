@@ -271,11 +271,17 @@ where
         // From the original implementation, seems that it does op_number - 1. Why? Not sure yet.
         let op_number = if op_number == 0 { 0 } else { op_number - 1 };
         let (_op_number, request) = self.log.get(op_number).unwrap();
+
         let sm = self.state_machine.clone();
+
         let result = sm.borrow_mut().apply(request.op.clone());
         let mut request = request.clone();
+
         request.result = Some(result.clone());
+
+        self.commit_number += 1;
         self.client_table.insert(request.client_id, request.clone());
+
         (result, request)
     }
 

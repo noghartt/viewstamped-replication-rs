@@ -56,8 +56,10 @@ impl<Input: Clone + std::fmt::Debug + 'static, Output: Clone + std::fmt::Debug +
     }
 }
 
-impl<Input: Clone + std::fmt::Debug + 'static, Output: Clone + std::fmt::Debug + 'static> Default
-    for History<Input, Output>
+impl<Input, Output> Default for History<Input, Output>
+where
+    Input: Clone + std::fmt::Debug + 'static,
+    Output: Clone + std::fmt::Debug + 'static,
 {
     fn default() -> Self {
         Self::new()
@@ -161,7 +163,7 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                 RuntimeEvents::ReplicaSnapshot { snapshot } => {
                     writeln!(
                         f,
-                        "[t={at:>5}]  R{} state view={} status={:?} op={} commit={} log_len={}",
+                        "[t={at:>5}]   R{} state view={} status={:?} op={} commit={} log_len={}",
                         snapshot.replica_number,
                         snapshot.view_number,
                         snapshot.status,
