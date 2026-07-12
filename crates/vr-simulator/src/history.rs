@@ -1,6 +1,6 @@
 use std::fmt;
 
-use vr_replica::{effect::Effect, message::Message, types::ReplicaId};
+use vr_replica::{effect::Effect, message::Message, snapshot::ReplicaSnapshot, types::ReplicaId};
 
 use crate::{
     network::NetworkSendOutcome,
@@ -27,6 +27,9 @@ pub enum RuntimeEvents<
         replica: ReplicaId,
         effect: Effect<Input, Output>,
     },
+    ReplicaSnapshot {
+        snapshot: ReplicaSnapshot,
+    },
 }
 
 #[derive(Debug)]
@@ -46,6 +49,10 @@ impl<Input: Clone + std::fmt::Debug + 'static, Output: Clone + std::fmt::Debug +
 
     pub fn insert_history_event(&mut self, at: u64, event: RuntimeEvents<Input, Output>) {
         self.events.push((at, event));
+    }
+
+    pub fn events(&self) -> &[(u64, RuntimeEvents<Input, Output>)] {
+        &self.events
     }
 }
 
@@ -134,7 +141,6 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                         outcome_label(outcome),
                     )?;
                 }
-
                 RuntimeEvents::NetworkDelivered { from, to, message } => {
                     writeln!(
                         f,
@@ -144,13 +150,24 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                         message_label(message),
                     )?;
                 }
-
                 RuntimeEvents::ReplicaOperation { replica, effect } => {
                     writeln!(
                         f,
                         "[t={at:>5}]  {:>3} {:>21}",
                         node_tag(&NodeKind::Replica(NodeId(*replica))),
                         format!("● {}", effect_tag(effect))
+                    )?;
+                }
+                RuntimeEvents::ReplicaSnapshot { snapshot } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]  R{} state view={} status={:?} op={} commit={} log_len={}",
+                        snapshot.replica_number,
+                        snapshot.view_number,
+                        snapshot.status,
+                        snapshot.op_number,
+                        snapshot.commit_number,
+                        snapshot.log.len(),
                     )?;
                 }
             }

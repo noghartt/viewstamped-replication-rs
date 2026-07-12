@@ -3,13 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::effect::Effect;
-use crate::message::{ClientRequest, Message};
-use crate::state_machine::StateMachine;
-use crate::types::{OpNumber, ReplicaId};
 use tracing::debug;
 
-#[derive(Clone, Debug, PartialEq)]
+use crate::effect::Effect;
+use crate::message::{ClientRequest, Message};
+use crate::snapshot::{LogEntrySnapshot, ReplicaSnapshot};
+use crate::state_machine::StateMachine;
+use crate::types::{OpNumber, ReplicaId};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Normal,
     ViewChange,
@@ -162,21 +164,21 @@ where
                 replica: self.replica_number,
                 op: op_number,
             });
+
+            self.commit_number = commit_number;
+
+            let prepare_ok = Message::PrepareOk {
+                view_number: self.view_number,
+                replica_number: self.replica_number,
+                op_number,
+                commit_number,
+            };
+
+            effects.push(Effect::Send {
+                to: self.view_number,
+                message: prepare_ok,
+            });
         }
-
-        self.commit_number = commit_number;
-
-        let prepare_ok = Message::PrepareOk {
-            view_number: self.view_number,
-            replica_number: self.replica_number,
-            op_number,
-            commit_number,
-        };
-
-        effects.push(Effect::Send {
-            to: self.view_number,
-            message: prepare_ok,
-        });
 
         effects
     }
@@ -275,5 +277,70 @@ where
         request.result = Some(result.clone());
         self.client_table.insert(request.client_id, request.clone());
         (result, request)
+    }
+
+    pub fn snapshot(&self) -> ReplicaSnapshot {
+        ReplicaSnapshot {
+            replica_number: self.replica_number,
+            status: self.status.clone(),
+            view_number: self.view_number,
+            op_number: self.op_number,
+            commit_number: self.commit_number,
+            log: self
+                .log
+                .iter()
+                .map(|(op_number, request)| LogEntrySnapshot {
+                    op_number: *op_number,
+                    client_id: request.client_id,
+                    request_number: request.request_number,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct KvState {
+        state: BTreeMap<String, u64>,
+    }
+
+    type Op = String;
+    impl StateMachine for KvState {
+        type Input = Op;
+        type Output = Op;
+
+        fn apply(&mut self, _: Self::Input) -> Self::Output {
+            String::from("applied...")
+        }
+    }
+
+    #[test]
+    fn snapshot_reports_initial_replica_state() {
+        let state_machine = Rc::new(RefCell::new(KvState::default()));
+        let replica = Replica::new(vec![0, 1, 2], 0, state_machine);
+
+        let snapshot = replica.snapshot();
+
+        assert_eq!(snapshot.replica_number, 0);
+        assert_eq!(snapshot.status, Status::Normal);
+        assert_eq!(snapshot.view_number, 0);
+        assert_eq!(snapshot.op_number, 0);
+        assert_eq!(snapshot.commit_number, 0);
+        assert!(snapshot.log.is_empty());
+    }
+
+    #[test]
+    fn snapshot_should_be_deterministic() {
+        let state_machine = Rc::new(RefCell::new(KvState::default()));
+        let replica = Replica::new(vec![0, 1, 2], 0, state_machine);
+
+        let a = replica.snapshot();
+        let b = replica.snapshot();
+
+        assert_eq!(a, b);
     }
 }

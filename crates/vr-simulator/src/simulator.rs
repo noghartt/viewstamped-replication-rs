@@ -162,11 +162,21 @@ impl Simulator<Op> {
 
         match to {
             NodeKind::Replica(id) => {
-                let Some(replica) = self.replicas.get_mut(&id) else {
-                    debug!(?id, "message to unknown replica dropped");
-                    return;
+                let (effects, snapshot) = {
+                    let Some(replica) = self.replicas.get_mut(&id) else {
+                        debug!(?id, "message to unknown replica dropped");
+                        return;
+                    };
+
+                    let effects = replica.on_message(message);
+                    let snapshot = replica.snapshot();
+
+                    (effects, snapshot)
                 };
-                let effects = replica.on_message(message);
+
+                self.history
+                    .insert_history_event(self.now, RuntimeEvents::ReplicaSnapshot { snapshot });
+
                 self.apply_effects(to, effects);
             }
             NodeKind::Client(id) => {
@@ -358,5 +368,23 @@ mod tests {
         };
 
         assert_eq!(format!("{h1:?}"), format!("{h2:?}"));
+    }
+
+    #[test]
+    fn records_replica_snapshot_after_delivery() {
+        let mut sim = setup(42, 3);
+        sim.create_network_perfect_mesh();
+        sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+        sim.run();
+
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::ReplicaSnapshot { snapshot }
+                    if snapshot.replica_number == 0
+                        && snapshot.op_number == 1
+                        && snapshot.log.len() == 1
+            )
+        }));
     }
 }

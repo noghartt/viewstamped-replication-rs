@@ -10,7 +10,7 @@ mod network;
 mod simulator;
 mod types;
 
-use rand::{RngExt, rng};
+use rand::RngExt;
 use simulator::Simulator;
 use types::NodeId;
 use vr_replica::{replica::Replica, state_machine::StateMachine};
@@ -165,7 +165,7 @@ fn start_seeded_workload(simulator: &mut Simulator<Op>, clients: &[NodeId]) {
         // NOTE: I'm not sure if we need the .clone() here.
         let started = simulator.start_client_request(
             *client_id,
-            Op::Set(key, simulator.rng.clone().random_range(1..100))
+            Op::Set(key, simulator.rng.clone().random_range(1..100)),
         );
 
         assert!(
