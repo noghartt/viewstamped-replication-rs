@@ -36,6 +36,5 @@ pub enum Message<I, O> {
         view_number: ReplicaId,
         replica_number: ReplicaId,
         op_number: usize,
-        commit_number: usize,
     },
 }

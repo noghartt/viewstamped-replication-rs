@@ -415,7 +415,7 @@ mod tests {
         let mut sim = setup(42, 3);
         sim.create_network_perfect_mesh();
         sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-        sim.run().unwrap_err();
+        sim.run().unwrap();
 
         assert!(sim.history.events().iter().any(|(_, event)| {
             matches!(
@@ -426,17 +426,5 @@ mod tests {
                         && snapshot.log.len() == 1
             )
         }));
-    }
-
-    #[test]
-    fn catches_reply_for_uncommitted_operation() {
-        let mut sim = setup(42, 3);
-        sim.create_network_perfect_mesh();
-        sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-
-        let violation = sim.run().unwrap_err();
-
-        assert_eq!(violation.invariant, "reply_implies_committed");
-        assert_eq!(violation.replica, 0);
     }
 }

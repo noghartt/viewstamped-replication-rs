@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::rc::Rc;
 
@@ -35,9 +35,13 @@ where
     op_number: usize,
     commit_number: usize,
     log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
+
+    // TODO: Based on the paper, I do need to implement a field that tracks if the given
+    // request has already been executed by the replica. If yes, I should store the result
+    // which have been returned by this replica.
     client_table: BTreeMap<u64, ClientRequest<Input, Output>>,
 
-    op_ack_table: BTreeMap<OpNumber, BTreeSet<ReplicaId>>,
+    op_ack_table: BTreeMap<ReplicaId, OpNumber>,
 
     state_machine: Rc<RefCell<dyn StateMachine<Input = Input, Output = Output>>>,
 }
@@ -84,20 +88,19 @@ where
                 view_number,
                 replica_number,
                 op_number,
-                commit_number,
-            } => self.on_prepare_ok(view_number, replica_number, op_number, commit_number),
+            } => self.on_prepare_ok(view_number, replica_number, op_number),
             m => panic!("unexpected message: {:?}", m),
         }
     }
 
     fn on_request(&mut self, request: ClientRequest<Input, Output>) -> Vec<Effect<Input, Output>> {
         if !self.is_primary() {
-            return vec![];
+            return Vec::new();
         }
 
         if let Some(last_request) = self.get_last_request_from_client(request.client_id) {
             if request.request_number < last_request.request_number {
-                return vec![];
+                return Vec::new();
             }
 
             if request.request_number == last_request.request_number {
@@ -119,6 +122,8 @@ where
         if self.log.len() + 1 == self.op_number {
             self.log.push((self.op_number, request.clone()));
         }
+
+        self.ack_request(self.replica_number, self.op_number);
 
         let prepare = Message::Prepare {
             op: request.op.clone(),
@@ -144,7 +149,7 @@ where
             .collect()
     }
 
-    // TODO: Add the implementation for the State Transfer ""
+    // TODO: Add the implementation for the State Transfer
     fn on_prepare(
         &mut self,
         request: Box<ClientRequest<Input, Output>>,
@@ -171,7 +176,6 @@ where
                 view_number: self.view_number,
                 replica_number: self.replica_number,
                 op_number,
-                commit_number,
             };
 
             effects.push(Effect::Send {
@@ -188,24 +192,24 @@ where
         view_number: ReplicaId,
         replica_number: ReplicaId,
         op_number: usize,
-        commit_number: usize,
     ) -> Vec<Effect<Input, Output>> {
         if !self.is_same_view(view_number) || !self.is_primary() {
-            return vec![];
+            return Vec::new();
         }
-
-        if op_number <= self.commit_number {
-            return vec![];
-        }
-
-        self.op_ack_table
-            .entry(op_number)
-            .or_default()
-            .insert(replica_number);
 
         let quorum = self.get_quorum();
-        if self.op_ack_table.get(&op_number).map_or(0, |s| s.len()) < quorum {
-            return vec![];
+
+        self.ack_request(replica_number, op_number);
+
+        let all_acked_ops = self
+            .op_ack_table
+            .values()
+            .filter(|op| **op == op_number)
+            .map(|op| *op)
+            .collect::<Vec<usize>>();
+
+        if all_acked_ops.len() < quorum {
+            return Vec::new();
         }
 
         let mut effects = vec![];
@@ -266,7 +270,7 @@ where
     }
 
     // TODO: Validate if it needs to do more operations here
-    pub fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
+    fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
         // TODO: Validate how exactly we should retrieve the op_number to be committed.
         // From the original implementation, seems that it does op_number - 1. Why? Not sure yet.
         let op_number = if op_number == 0 { 0 } else { op_number - 1 };
@@ -283,6 +287,13 @@ where
         self.client_table.insert(request.client_id, request.clone());
 
         (result, request)
+    }
+
+    fn ack_request(&mut self, replica_number: u64, op_number: usize) {
+        self.op_ack_table
+            .entry(replica_number)
+            .and_modify(|op| *op = (*op).max(op_number))
+            .or_insert(op_number);
     }
 
     pub fn snapshot(&self) -> ReplicaSnapshot {
@@ -304,7 +315,6 @@ where
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +358,124 @@ mod tests {
         let b = replica.snapshot();
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn out_of_order_ack_quorum_still_commits_in_order() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(1, 1, "a"));
+        primary.on_message(request(2, 1, "b"));
+
+        let effects_a = primary.on_message(prepare_ok(1, 2));
+        let effects_b = primary.on_message(prepare_ok(2, 2));
+
+        assert_eq!(primary.snapshot().commit_number, 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+
+        let replied_to: Vec<u64> = effects_a
+            .iter()
+            .chain(effects_b.iter())
+            .filter_map(|e| match e {
+                Effect::Reply { client_id, .. } => Some(*client_id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(replied_to, vec![1, 2]);
+    }
+
+    #[test]
+    fn duplicate_ack_after_quorum_executes_once() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(1, 1, "a"));
+
+        primary.on_message(prepare_ok(1, 1));
+        primary.on_message(prepare_ok(2, 1));
+
+        assert_eq!(primary.snapshot().commit_number, 1);
+        assert_eq!(sm.borrow().applied.len(), 1);
+
+        let effects = primary.on_message(prepare_ok(1, 1));
+
+        assert_eq!(sm.borrow().applied.len(), 1);
+        assert_eq!(primary.snapshot().commit_number, 1);
+        assert!(effects.iter().all(|e| !matches!(e, Effect::Reply { .. })));
+    }
+
+    #[test]
+    fn primary_counts_itself_toward_quorum() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(1, 1, "a"));
+
+        assert_eq!(primary.snapshot().commit_number, 0);
+
+        let effects = primary.on_message(prepare_ok(1, 1));
+
+        assert_eq!(primary.snapshot().commit_number, 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+
+        let replies = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Reply { .. }))
+            .count();
+
+        assert_eq!(replies, 1);
+    }
+
+    #[test]
+    fn stale_ack_does_not_regress_watermark() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2, 3, 4], 0, sm.clone());
+
+        primary.on_message(request(1, 1, "a"));
+        primary.on_message(request(2, 1, "b"));
+
+        primary.on_message(prepare_ok(1, 2));
+
+        assert_eq!(primary.snapshot().commit_number, 0);
+
+        primary.on_message(prepare_ok(1, 1));
+        primary.on_message(prepare_ok(2, 2));
+
+        assert_eq!(primary.snapshot().commit_number, 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    fn request(client_id: u64, request_number: usize, op: &str) -> Message<String, String> {
+        Message::Request(ClientRequest {
+            op: op.to_string(),
+            client_id,
+            request_number,
+            result: None,
+        })
+    }
+
+    fn prepare_ok(replica_number: ReplicaId, op_number: usize) -> Message<String, String> {
+        Message::PrepareOk {
+            view_number: 0,
+            replica_number,
+            op_number,
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSm {
+        applied: Vec<String>,
+    }
+
+    impl StateMachine for RecordingSm {
+        type Input = String;
+        type Output = String;
+
+        fn apply(&mut self, input: Self::Input) -> Self::Output {
+            self.applied.push(input.clone());
+            format!("applied-{input}")
+        }
     }
 }
