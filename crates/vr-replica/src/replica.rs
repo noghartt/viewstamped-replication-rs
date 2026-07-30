@@ -118,11 +118,10 @@ where
             }
         };
 
-        self.op_number += 1;
-        if self.log.len() + 1 == self.op_number {
-            self.log.push((self.op_number, request.clone()));
-        }
+        debug_assert_eq!(self.log.len(), self.op_number);
 
+        self.op_number += 1;
+        self.log.push((self.op_number, request.clone()));
         self.ack_request(self.replica_number, self.op_number);
 
         let prepare = Message::Prepare {
@@ -197,37 +196,28 @@ where
             return Vec::new();
         }
 
-        let quorum = self.get_quorum();
-
         self.ack_request(replica_number, op_number);
 
-        let all_acked_ops = self
-            .op_ack_table
-            .values()
-            .filter(|op| **op == op_number)
-            .map(|op| *op)
-            .collect::<Vec<usize>>();
+        let committed = self.commit_up_to(self.commit_point());
 
-        if all_acked_ops.len() < quorum {
-            return Vec::new();
-        }
+        debug_assert!(self.commit_number <= self.op_number);
 
-        let mut effects = vec![];
-        let (result, request) = self.commit_op(op_number);
+        committed
+            .into_iter()
+            .map(|(result, request)| {
+                let reply = Message::Reply {
+                    client_id: request.client_id.clone(),
+                    view_number: self.view_number,
+                    request_id: request.request_number,
+                    result: Some(result),
+                };
 
-        let reply = Message::Reply {
-            client_id: request.client_id.clone(),
-            view_number: self.view_number,
-            request_id: request.request_number,
-            result: Some(result),
-        };
-
-        effects.push(Effect::Reply {
-            client_id: request.client_id.clone(),
-            message: reply,
-        });
-
-        effects
+                Effect::Reply {
+                    client_id: request.client_id,
+                    message: reply,
+                }
+            })
+            .collect()
     }
 
     fn on_commit(
@@ -244,7 +234,7 @@ where
             return Vec::new();
         }
 
-        let _ = self.commit_op(op_number);
+        self.commit_op(op_number);
 
         vec![Effect::Committed {
             replica: self.replica_number,
@@ -271,10 +261,9 @@ where
 
     // TODO: Validate if it needs to do more operations here
     fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
-        // TODO: Validate how exactly we should retrieve the op_number to be committed.
-        // From the original implementation, seems that it does op_number - 1. Why? Not sure yet.
-        let op_number = if op_number == 0 { 0 } else { op_number - 1 };
-        let (_op_number, request) = self.log.get(op_number).unwrap();
+        debug_assert_eq!(op_number, self.commit_number + 1);
+
+        let (_, request) = self.log.get(op_number - 1).unwrap();
 
         let sm = self.state_machine.clone();
 
@@ -283,7 +272,7 @@ where
 
         request.result = Some(result.clone());
 
-        self.commit_number += 1;
+        self.commit_number = op_number;
         self.client_table.insert(request.client_id, request.clone());
 
         (result, request)
@@ -294,6 +283,24 @@ where
             .entry(replica_number)
             .and_modify(|op| *op = (*op).max(op_number))
             .or_insert(op_number);
+    }
+
+    fn commit_point(&self) -> usize {
+        let mut acked_ops: Vec<usize> = self
+            .configuration
+            .iter()
+            .map(|r| self.op_ack_table.get(r).copied().unwrap_or(0))
+            .collect();
+        acked_ops.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        acked_ops[self.get_quorum() - 1]
+    }
+
+    fn commit_up_to(&mut self, target: usize) -> Vec<(Output, ClientRequest<Input, Output>)> {
+        let mut committed = vec![];
+        while self.commit_number < target {
+            committed.push(self.commit_op(self.commit_number + 1));
+        }
+        committed
     }
 
     pub fn snapshot(&self) -> ReplicaSnapshot {
