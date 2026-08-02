@@ -427,4 +427,34 @@ mod tests {
             )
         }));
     }
+
+    #[test]
+    fn smoke_perfect_mesh_commits_and_replies_once() {
+        const SEED: u64 = 4_789_780_388_901_646_590;
+
+        let mut sim = setup(SEED, 3);
+        sim.create_network_perfect_mesh();
+        sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+        sim.run().unwrap();
+
+        let replica_primary = sim.replicas.get(&NodeId(0)).expect("primary should exist");
+        let replica_snapshot = replica_primary.snapshot();
+
+        assert_eq!(replica_snapshot.commit_number, 1);
+        assert_eq!(replica_snapshot.op_number, 1);
+        assert_eq!(replica_snapshot.log.len(), 1);
+
+        let entry = &replica_snapshot.log[0];
+        assert_eq!(entry.op_number, 1);
+        assert_eq!(entry.client_id, 0);
+        assert_eq!(entry.request_number, 0);
+
+        let clients = sim.get_clients();
+        assert_eq!(clients.len(), 1);
+
+        let client = &clients[0];
+        assert_eq!(client.replies_received, 1);
+        assert_eq!(client.request_number, 1);
+        assert_eq!(client.state.get("k"), Some(&7));
+    }
 }
