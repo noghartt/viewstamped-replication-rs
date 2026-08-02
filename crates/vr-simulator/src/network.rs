@@ -36,7 +36,13 @@ pub enum NetworkSendOutcome {
 
 impl Link {
     fn perfect_link() -> Link {
-        Self { partitioned: false, base_ms: 1, jitter_ms: 0, drop_probability: 0, duplication_probability: 0 }
+        Self {
+            partitioned: false,
+            base_ms: 1,
+            jitter_ms: 0,
+            drop_probability: 0,
+            duplication_probability: 0,
+        }
     }
 }
 
@@ -197,7 +203,7 @@ impl Network {
             return NetworkSendOutcome::Dropped;
         }
 
-        let at = now + link.base_ms + Self::jitter(&link, rng);
+        let at = Self::delivery_time(now, &link, rng);
 
         // TODO: Duplication is capped at exactly 2 copies — an artifact of a
         // single roll, not a modeling decision. Make it recursive instead: each
@@ -210,7 +216,7 @@ impl Network {
         // Determinism is preserved: variable draw *count* is fine, only the
         // draw *sequence* must stay deterministic.
         if rng.random_range(0..100) < link.duplication_probability {
-            let duplicated_at = now + link.base_ms + Self::jitter(&link, rng);
+            let duplicated_at = Self::delivery_time(now, &link, rng);
             return NetworkSendOutcome::Duplicated { at, duplicated_at };
         }
 
@@ -233,5 +239,12 @@ impl Network {
             drop_probability: rng.random_range(0..30),
             duplication_probability: rng.random_range(0..50),
         }
+    }
+
+    fn delivery_time(now: u64, link: &Link, rng: &mut ChaCha8Rng) -> u64 {
+        let jitter = Self::jitter(link, rng);
+        now.checked_add(link.base_ms)
+            .and_then(|at| at.checked_add(jitter))
+            .expect("virtual time overflow while scheduling network delivery")
     }
 }

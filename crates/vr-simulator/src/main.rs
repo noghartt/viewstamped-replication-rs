@@ -18,7 +18,7 @@ use vr_replica::{replica::Replica, state_machine::StateMachine};
 
 use crate::client::{Client, Op};
 use crate::invariants::InvariantViolation;
-use crate::simulator::SimulatorConfig;
+use crate::simulator::{SimulatorConfig, SimulatorRunOutcome};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,8 +57,11 @@ struct CliConfig {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     clients: u64,
 
-    #[arg(alias = "config-run-until-max-time")]
+    #[arg(long = "max-time")]
     run_until_max_time: Option<u64>,
+
+    #[arg(long = "max-events")]
+    run_until_max_events: Option<u64>,
 
     #[arg(default_value_t = 1)]
     link_base_ms: u64,
@@ -104,8 +107,8 @@ fn main() -> std::process::ExitCode {
 fn run_single_simulation(seed: u64, config: &CliConfig) -> Result<(), InvariantViolation> {
     let mut simulator = setup_simulation(seed, config);
     match simulator.run() {
-        Ok(()) => {
-            print_simulation_summary(seed, &simulator, config.history);
+        Ok(outcome) => {
+            print_simulation_summary(seed, &simulator, outcome, config.history);
             Ok(())
         }
         Err(violation) => {
@@ -141,6 +144,7 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
     let simulator_config = SimulatorConfig {
         disable_timers: config.disable_timers,
         run_until_max_time: config.run_until_max_time,
+        run_until_max_events: config.run_until_max_events,
     };
 
     let mut simulator = Simulator::with_seed(seed, Some(simulator_config));
@@ -205,8 +209,16 @@ fn start_seeded_workload(simulator: &mut Simulator<Op>, clients: &[NodeId]) {
     }
 }
 
-fn print_simulation_summary(seed: u64, simulator: &Simulator<Op>, log_history: bool) {
-    println!("finished simulation seed={seed} now={}", simulator.now);
+fn print_simulation_summary(
+    seed: u64,
+    simulator: &Simulator<Op>,
+    outcome: SimulatorRunOutcome,
+    log_history: bool,
+) {
+    println!(
+        "finished simulation outcome={:?} seed={seed} now={}",
+        outcome, simulator.now,
+    );
 
     for client in simulator.get_clients() {
         println!("client={} state={:?}", client.id.0, client.state);

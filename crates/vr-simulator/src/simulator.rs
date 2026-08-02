@@ -13,6 +13,21 @@ use crate::invariants::{InvariantViolation, StateChecker};
 use crate::network::{Network, NetworkSendOutcome};
 use crate::types::{Clients, NodeId, NodeKind, Replicas};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EventClass {
+    Fault,
+    Delivery,
+    Timer,
+    ClientRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulatorRunOutcome {
+    Quiesced,
+    TimeLimit,
+    EventLimit,
+}
+
 /// The message rides IN the event: duplicating a message means scheduling the
 /// same cloned event twice, which is correct by construction. (The previous
 /// design — a Deliver token draining a shared inbox — made "duplicate" deliver
@@ -30,11 +45,28 @@ enum WheelEvent<Input> {
     },
 }
 
+impl<Input> WheelEvent<Input> {
+    fn class(&self) -> EventClass {
+        match self {
+            WheelEvent::ClientRequest { .. } => EventClass::ClientRequest,
+            WheelEvent::Deliver { .. } => EventClass::Delivery,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SimulatorConfig {
     pub disable_timers: bool,
     pub run_until_max_time: Option<u64>,
+    pub run_until_max_events: Option<u64>,
 }
+
+/// This is the key that maps each event on wheel. It composes by:
+///
+/// - Time
+/// - EventClass
+/// - Monotonic ID
+type EventKey = (u64, EventClass, u64);
 
 #[derive(Debug)]
 pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
@@ -42,13 +74,16 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     seed: u64,
     pub now: u64,
     pub rng: ChaCha8Rng,
-    wheel: BTreeMap<u64, Vec<WheelEvent<Input>>>,
     network: Network,
     pub history: History<Input, Op>,
     checker: StateChecker,
 
     replicas: Replicas<Input, Op>,
     clients: Clients,
+
+    wheel: BTreeMap<EventKey, WheelEvent<Input>>,
+    next_event_sequence: u64,
+    events_processed: u64,
 }
 
 impl Simulator<Op> {
@@ -61,59 +96,71 @@ impl Simulator<Op> {
             seed,
             rng: ChaCha8Rng::seed_from_u64(seed),
             now: 0,
-            wheel: BTreeMap::new(),
             network: Network::new(),
             history: History::new(),
             replicas: BTreeMap::new(),
             clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
             checker: StateChecker::new(),
+
+            wheel: BTreeMap::new(),
+            events_processed: 0,
+            next_event_sequence: 0,
         }
     }
 
-    pub fn run(&mut self) -> Result<(), InvariantViolation> {
+    pub fn run(&mut self) -> Result<SimulatorRunOutcome, InvariantViolation> {
         info!(seed = self.seed, "starting running simulation");
-        // TODO: Handle scenarios like tick/heartbeat to avoid infinite loops for each simulation.
-        while !self.wheel.is_empty()
-            && self
+
+        loop {
+            let Some(&(next_at, _, _)) = self.wheel.keys().next() else {
+                return Ok(SimulatorRunOutcome::Quiesced);
+            };
+
+            if self
                 .config
                 .run_until_max_time
-                .is_none_or(|max| self.now < max)
-        {
+                .is_some_and(|max| next_at > max)
+            {
+                return Ok(SimulatorRunOutcome::TimeLimit);
+            }
+
+            if self
+                .config
+                .run_until_max_events
+                .is_some_and(|max| self.events_processed >= max)
+            {
+                return Ok(SimulatorRunOutcome::EventLimit);
+            }
+
             self.step()?;
         }
-
-        Ok(())
     }
 
     fn step(&mut self) -> Result<(), InvariantViolation> {
-        let Some((&at, _)) = self.wheel.iter().next() else {
-            // Returning success, because no more items here to iterate through the wheel.
-            return Ok(());
-        };
+        let key = *self
+            .wheel
+            .keys()
+            .next()
+            .expect("step requires pending events");
 
-        // Time only moves forward: an event scheduled in the past is a
-        // harness bug (not a protocol bug), so it panics rather than drops.
-        assert!(
-            at >= self.now,
-            "wheel event at {at} is before now {}",
-            self.now
-        );
+        let event = self.wheel.remove(&key).expect("event key came from wheel");
 
-        let evs = self.wheel.remove(&at).unwrap();
+        let (at, _, _) = key;
         self.now = at;
 
-        debug!(now = self.now, events = ?evs, "triggering step");
+        self.events_processed = self
+            .events_processed
+            .checked_add(1)
+            .expect("processed event count overflow");
 
-        for ev in evs {
-            match ev {
-                WheelEvent::Deliver { from, to, message } => {
-                    self.deliver(from, to, message)?;
-                }
-                WheelEvent::ClientRequest { client_id, op } => {
-                    self.client_request(client_id, op);
-                }
-            }
+        self.dispatch(event)
+    }
+
+    fn dispatch(&mut self, event: WheelEvent<Op>) -> Result<(), InvariantViolation> {
+        match event {
+            WheelEvent::ClientRequest { client_id, op } => self.client_request(client_id, op),
+            WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message)?,
         }
 
         Ok(())
@@ -337,7 +384,23 @@ impl Simulator<Op> {
     }
 
     fn schedule_event(&mut self, at: u64, event: WheelEvent<Op>) {
-        self.wheel.entry(at).or_default().push(event);
+        assert!(
+            at >= self.now,
+            "cannot schedule event at {at} before now {}",
+            self.now,
+        );
+
+        let class = event.class();
+        let sequence = self.next_event_sequence;
+
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .expect("event sequence overflow");
+
+        let replaced = self.wheel.insert((at, class, sequence), event);
+
+        debug_assert!(replaced.is_none())
     }
 }
 
@@ -378,8 +441,8 @@ mod tests {
         }
     }
 
-    fn setup(seed: u64, replicas: u64) -> Simulator<Op> {
-        let mut sim = Simulator::with_seed(seed, None);
+    fn setup(seed: u64, replicas: u64, config: Option<SimulatorConfig>) -> Simulator<Op> {
+        let mut sim = Simulator::with_seed(seed, config);
         let configuration: Vec<u64> = (0..replicas).collect();
         for id in 0..replicas {
             let sm = Rc::new(RefCell::new(KvState::default()));
@@ -390,9 +453,236 @@ mod tests {
     }
 
     #[test]
+    fn hit_event_limit_with_max_events_zero() {
+        let config = SimulatorConfig {
+            run_until_max_events: Some(0),
+            ..Default::default()
+        };
+        let mut s = setup(42, 3, Some(config));
+        s.create_network_mesh();
+        s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+        let output = s.run().unwrap();
+
+        assert_eq!(output, SimulatorRunOutcome::EventLimit)
+    }
+
+    #[test]
+    fn validate_event_execute_on_max_time_limit() {
+        let config = SimulatorConfig {
+            run_until_max_time: Some(10),
+            ..Default::default()
+        };
+        let mut s = setup(42, 3, Some(config));
+        s.create_network_perfect_mesh();
+
+        s.schedule_event(
+            10,
+            WheelEvent::Deliver {
+                from: NodeKind::Replica(NodeId(1)),
+                to: NodeKind::Replica(NodeId(0)),
+                message: Message::PrepareOk {
+                    view_number: 1,
+                    replica_number: 1,
+                    op_number: 1,
+                },
+            },
+        );
+
+        assert_eq!(s.now, 0);
+        assert_eq!(s.events_processed, 0);
+        assert_eq!(s.wheel.len(), 1);
+        assert!(s.history.events().is_empty());
+
+        let outcome = s.run().unwrap();
+
+        assert_eq!(outcome, SimulatorRunOutcome::Quiesced);
+        assert!(s.wheel.is_empty());
+        assert_eq!(s.now, 10);
+    }
+
+    #[test]
+    fn event_class_priority_is_stable() {
+        assert!(EventClass::Fault < EventClass::Delivery);
+        assert!(EventClass::Delivery < EventClass::Timer);
+        assert!(EventClass::Timer < EventClass::ClientRequest);
+    }
+
+    #[test]
+    fn hit_time_limit_when_max_time_reaches() {
+        let config = SimulatorConfig {
+            run_until_max_time: Some(2),
+            ..Default::default()
+        };
+        let mut s = setup(42, 3, Some(config));
+        s.create_network_mesh();
+        s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+
+        assert_eq!(s.now, 0);
+        assert_eq!(s.events_processed, 0);
+        assert_eq!(s.wheel.len(), 1);
+        assert!(s.history.events().is_empty());
+
+        let output = s.run().unwrap();
+
+        assert!(s.now <= 2);
+        assert_eq!(s.events_processed, 1);
+        assert!(!s.wheel.is_empty());
+        assert_eq!(output, SimulatorRunOutcome::TimeLimit)
+    }
+
+    #[test]
+    fn delivery_precedes_client_request_at_same_time() {
+        let mut sim = setup(42, 3, None);
+        sim.create_network_perfect_mesh();
+
+        assert!(sim.start_client_request(NodeId(0), Op::Set("client-request".into(), 1),));
+
+        sim.schedule_event(
+            0,
+            WheelEvent::Deliver {
+                from: NodeKind::Replica(NodeId(1)),
+                to: NodeKind::Client(NodeId(0)),
+                message: Message::Error {
+                    message: "delivery".into(),
+                },
+            },
+        );
+
+        sim.step().unwrap();
+
+        assert_eq!(sim.events_processed, 1);
+
+        assert!(matches!(
+            sim.history.events().first(),
+            Some((
+                0,
+                RuntimeEvents::NetworkDelivered {
+                    from: NodeKind::Replica(NodeId(1)),
+                    to: NodeKind::Client(NodeId(0)),
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn same_time_client_requests_are_dispatched_fifo() {
+        let mut sim = setup(42, 3, None);
+        sim.create_network_perfect_mesh();
+
+        assert!(sim.start_client_request(NodeId(0), Op::Set("first".into(), 1),));
+        assert!(sim.start_client_request(NodeId(0), Op::Set("second".into(), 2),));
+
+        sim.step().unwrap();
+        sim.step().unwrap();
+
+        let sent_keys: Vec<String> = sim
+            .history
+            .events()
+            .iter()
+            .filter_map(|(_, event)| {
+                let RuntimeEvents::NetworkRequest {
+                    from,
+                    to,
+                    message: Message::Request(request),
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+
+                if *from != NodeKind::Client(NodeId(0)) || *to != NodeKind::Replica(NodeId(0)) {
+                    return None;
+                }
+
+                match &request.op {
+                    Op::Set(key, _) => Some(key.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        assert_eq!(sent_keys, vec!["first".to_string(), "second".to_string()])
+    }
+
+    #[test]
+    fn quiescence_wins_when_last_allowed_event_drains_wheel() {
+        let config = SimulatorConfig {
+            run_until_max_events: Some(2),
+            ..Default::default()
+        };
+
+        let mut sim = setup(42, 3, Some(config));
+
+        for replica in [1, 2] {
+            sim.schedule_event(
+                0,
+                WheelEvent::Deliver {
+                    from: NodeKind::Replica(NodeId(replica)),
+                    to: NodeKind::Client(NodeId(0)),
+                    message: Message::Error {
+                        message: format!("event from replica {replica}"),
+                    },
+                },
+            );
+        }
+
+        let outcome = sim.run().unwrap();
+
+        assert_eq!(sim.events_processed, 2);
+        assert!(sim.wheel.is_empty());
+        assert_eq!(outcome, SimulatorRunOutcome::Quiesced);
+    }
+
+    #[test]
+    fn event_limit_leaves_remaining_event_pending() {
+        let config = SimulatorConfig {
+            run_until_max_events: Some(2),
+            ..Default::default()
+        };
+
+        let mut sim = setup(42, 3, Some(config));
+
+        for replica in [0, 1, 2] {
+            sim.schedule_event(
+                0,
+                WheelEvent::Deliver {
+                    from: NodeKind::Replica(NodeId(replica)),
+                    to: NodeKind::Client(NodeId(0)),
+                    message: Message::Error {
+                        message: format!("event from replica {replica}"),
+                    },
+                },
+            );
+        }
+
+        let outcome = sim.run().unwrap();
+
+        assert_eq!(sim.events_processed, 2);
+        assert_eq!(sim.wheel.len(), 1);
+        assert_eq!(outcome, SimulatorRunOutcome::EventLimit);
+    }
+
+    #[test]
+    fn enforce_hard_stop_after_hitting_max_event() {
+        let config = SimulatorConfig {
+            run_until_max_events: Some(5),
+            ..Default::default()
+        };
+        let mut s = setup(42, 3, Some(config));
+        s.create_network_perfect_mesh();
+        s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+        let output = s.run().unwrap();
+
+        assert_eq!(s.events_processed, 5);
+        assert!(!s.wheel.is_empty());
+        assert_eq!(output, SimulatorRunOutcome::EventLimit)
+    }
+
+    #[test]
     fn same_seed_same_history() {
         let h1 = {
-            let mut s = setup(42, 3);
+            let mut s = setup(42, 3, None);
             s.create_network_mesh();
             s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
             s.run().unwrap();
@@ -400,7 +690,7 @@ mod tests {
         };
 
         let h2 = {
-            let mut s = setup(42, 3);
+            let mut s = setup(42, 3, None);
             s.create_network_mesh();
             s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
             s.run().unwrap();
@@ -412,7 +702,7 @@ mod tests {
 
     #[test]
     fn records_replica_snapshot_after_delivery() {
-        let mut sim = setup(42, 3);
+        let mut sim = setup(42, 3, None);
         sim.create_network_perfect_mesh();
         sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
         sim.run().unwrap();
@@ -432,7 +722,7 @@ mod tests {
     fn smoke_perfect_mesh_commits_and_replies_once() {
         const SEED: u64 = 4_789_780_388_901_646_590;
 
-        let mut sim = setup(SEED, 3);
+        let mut sim = setup(SEED, 3, None);
         sim.create_network_perfect_mesh();
         sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
         sim.run().unwrap();
