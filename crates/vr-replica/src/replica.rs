@@ -103,6 +103,10 @@ where
                 return Vec::new();
             }
 
+            if last_request.result.is_none() {
+                return Vec::new();
+            }
+
             if request.request_number == last_request.request_number {
                 let reply = Message::Reply {
                     client_id: request.client_id,
@@ -122,6 +126,7 @@ where
 
         self.op_number += 1;
         self.log.push((self.op_number, request.clone()));
+        self.client_table.insert(request.client_id, request.clone());
         self.ack_request(self.replica_number, self.op_number);
 
         let prepare = Message::Prepare {
@@ -449,6 +454,140 @@ mod tests {
 
         primary.on_message(prepare_ok(1, 1));
         primary.on_message(prepare_ok(2, 2));
+
+        assert_eq!(primary.snapshot().commit_number, 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_duplicate_messages_before_commit() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        let effects = primary.on_message(request(1, 1, "a"));
+
+        assert_eq!(primary.snapshot().op_number, 1);
+        assert_eq!(primary.snapshot().commit_number, 0);
+        assert_eq!(primary.snapshot().log.len(), 1);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Send { .. }))
+                .count(),
+            2
+        );
+        assert!(sm.borrow().applied.is_empty());
+
+        let effects = primary.on_message(request(1, 1, "a"));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot().op_number, 1);
+        assert_eq!(primary.snapshot().commit_number, 0);
+        assert_eq!(primary.snapshot().log.len(), 1);
+        assert!(sm.borrow().applied.is_empty());
+
+        let commit_effects = primary.on_message(prepare_ok(1, 1));
+
+        assert_eq!(primary.snapshot().commit_number, 1);
+        assert_eq!(primary.snapshot().log.len(), 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+        assert_eq!(
+            commit_effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Reply { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_request_after_commit_returns_cached_reply_without_execution() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(1, 1, "a"));
+        primary.on_message(prepare_ok(1, 1));
+
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+
+        let effects = primary.on_message(request(1, 1, "a"));
+
+        assert_eq!(primary.snapshot().op_number, 1);
+        assert_eq!(primary.snapshot().commit_number, 1);
+        assert_eq!(primary.snapshot().log.len(), 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Reply { .. }))
+                .count(),
+            1
+        );
+
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Send { .. }))
+        );
+
+        match effects.as_slice() {
+            [
+                Effect::Reply {
+                    client_id,
+                    message:
+                        Message::Reply {
+                            request_id, result, ..
+                        },
+                },
+            ] => {
+                assert_eq!(*client_id, 1);
+                assert_eq!(*request_id, 1);
+                assert_eq!(result.as_deref(), Some("applied-a"));
+            }
+            other => panic!("expected one cached reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn older_request_number_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(1, 2, "newer"));
+
+        let effects = primary.on_message(request(1, 1, "older"));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot().op_number, 1);
+        assert_eq!(primary.snapshot().log.len(), 1);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn newer_request_is_appended_after_previous_request_completes() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(1, 1, "a"));
+        primary.on_message(prepare_ok(1, 1));
+
+        let effects = primary.on_message(request(1, 2, "b"));
+
+        assert_eq!(primary.snapshot().op_number, 2);
+        assert_eq!(primary.snapshot().commit_number, 1);
+        assert_eq!(primary.snapshot().log.len(), 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Send { .. }))
+                .count(),
+            2
+        );
+
+        primary.on_message(prepare_ok(1, 2));
 
         assert_eq!(primary.snapshot().commit_number, 2);
         assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);

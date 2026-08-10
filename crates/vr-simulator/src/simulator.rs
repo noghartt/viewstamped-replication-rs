@@ -41,6 +41,7 @@ enum WheelEvent<Input> {
     },
     ClientRequest {
         client_id: NodeId,
+        request_number: usize,
         op: Input,
     },
 }
@@ -159,7 +160,11 @@ impl Simulator<Op> {
 
     fn dispatch(&mut self, event: WheelEvent<Op>) -> Result<(), InvariantViolation> {
         match event {
-            WheelEvent::ClientRequest { client_id, op } => self.client_request(client_id, op),
+            WheelEvent::ClientRequest {
+                client_id,
+                request_number,
+                op,
+            } => self.client_request(client_id, request_number, op),
             WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message)?,
         }
 
@@ -171,11 +176,23 @@ impl Simulator<Op> {
     }
 
     pub fn start_client_request(&mut self, client_id: NodeId, op: Op) -> bool {
-        if !self.clients.contains_key(&client_id) {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+
+        if client.has_pending_request() {
             return false;
         }
 
-        self.schedule_event(self.now, WheelEvent::ClientRequest { client_id, op });
+        let request_number = client.lock_request_number();
+        self.schedule_event(
+            self.now,
+            WheelEvent::ClientRequest {
+                client_id,
+                request_number,
+                op,
+            },
+        );
 
         true
     }
@@ -266,7 +283,7 @@ impl Simulator<Op> {
         Ok(())
     }
 
-    fn client_request(&mut self, client_id: NodeId, op: Op) {
+    fn client_request(&mut self, client_id: NodeId, request_number: usize, op: Op) {
         let Some(client) = self.clients.get_mut(&client_id) else {
             debug!(?client_id, "request for unknown client dropped");
             return;
@@ -275,7 +292,7 @@ impl Simulator<Op> {
         let request = ClientRequest {
             op,
             client_id: client.id.0,
-            request_number: client.request_number as usize,
+            request_number,
             result: None,
         };
 
@@ -568,12 +585,54 @@ mod tests {
     #[test]
     fn same_time_client_requests_are_dispatched_fifo() {
         let mut sim = setup(42, 3, None);
+        let configuration = vec![0, 1, 2];
+
+        sim.add_client(NodeId(1), Client::new(NodeId(1), configuration));
         sim.create_network_perfect_mesh();
 
         assert!(sim.start_client_request(NodeId(0), Op::Set("first".into(), 1),));
-        assert!(sim.start_client_request(NodeId(0), Op::Set("second".into(), 2),));
+        assert!(sim.start_client_request(NodeId(1), Op::Set("second".into(), 2),));
 
         sim.step().unwrap();
+        sim.step().unwrap();
+
+        let sent_keys: Vec<String> = sim
+            .history
+            .events()
+            .iter()
+            .filter_map(|(_, event)| {
+                let RuntimeEvents::NetworkRequest {
+                    from,
+                    to,
+                    message: Message::Request(request),
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+
+                if !matches!(from, NodeKind::Client(_)) || *to != NodeKind::Replica(NodeId(0)) {
+                    return None;
+                }
+
+                match &request.op {
+                    Op::Set(key, _) => Some(key.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        assert_eq!(sent_keys, vec!["first".to_string(), "second".to_string()])
+    }
+
+    #[test]
+    fn second_client_request_is_rejected_while_first_is_pending() {
+        let mut sim = setup(42, 3, None);
+        sim.create_network_perfect_mesh();
+
+        assert!(sim.start_client_request(NodeId(0), Op::Set("first".into(), 1),));
+        assert!(!sim.start_client_request(NodeId(0), Op::Set("second".into(), 2),));
+
         sim.step().unwrap();
 
         let sent_keys: Vec<String> = sim
@@ -602,7 +661,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(sent_keys, vec!["first".to_string(), "second".to_string()])
+        assert_eq!(sent_keys, vec!["first".to_string()]);
     }
 
     #[test]
@@ -737,7 +796,7 @@ mod tests {
         let entry = &replica_snapshot.log[0];
         assert_eq!(entry.op_number, 1);
         assert_eq!(entry.client_id, 0);
-        assert_eq!(entry.request_number, 0);
+        assert_eq!(entry.request_number, 1);
 
         let clients = sim.get_clients();
         assert_eq!(clients.len(), 1);
