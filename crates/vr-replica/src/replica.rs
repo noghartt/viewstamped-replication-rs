@@ -614,9 +614,9 @@ mod tests {
         let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
 
         let req: ClientRequest<String, String> = ClientRequest {
-            client_id: 10,
+            client_id: 1,
             op: String::from("a"),
-            request_number: 7,
+            request_number: 1,
             result: None,
         };
 
@@ -652,9 +652,9 @@ mod tests {
         let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
 
         let req: ClientRequest<String, String> = ClientRequest {
-            client_id: 1,
+            client_id: 10,
             op: String::from("a"),
-            request_number: 1,
+            request_number: 7,
             result: None,
         };
 
@@ -697,6 +697,27 @@ mod tests {
             .collect();
 
         assert_eq!(committed, vec![1, 2]);
+        assert_eq!(
+            backup
+                .client_table
+                .get(&10)
+                .and_then(|request| request.result.as_deref()),
+            Some("applied-a")
+        );
+        assert_eq!(
+            backup
+                .client_table
+                .get(&20)
+                .and_then(|request| request.result.as_deref()),
+            Some("applied-b")
+        );
+        assert_eq!(
+            backup
+                .client_table
+                .get(&30)
+                .and_then(|request| request.result.as_deref()),
+            None
+        );
         assert!(
             effects
                 .iter()
@@ -724,6 +745,119 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn stale_prepare_commit_does_not_regress_backup() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+
+        let req: ClientRequest<String, String> = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req.clone()));
+        backup.on_message(prepare(
+            String::from("b"),
+            2,
+            1,
+            ClientRequest {
+                op: String::from("b"),
+                client_id: 20,
+                ..req.clone()
+            },
+        ));
+
+        let effects = backup.on_message(prepare(
+            String::from("c"),
+            3,
+            0,
+            ClientRequest {
+                op: String::from("c"),
+                client_id: 30,
+                ..req
+            },
+        ));
+
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Committed { .. }))
+        );
+
+        assert_eq!(backup.snapshot().commit_number, 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Prepared { replica: 1, op: 3 }))
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Send {
+                to: 0,
+                message: Message::PrepareOk {
+                    view_number: 0,
+                    replica_number: 1,
+                    op_number: 3,
+                }
+            }
+        )));
+    }
+
+    #[test]
+    fn prepare_commit_beyond_local_log_is_clamped() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+
+        let req: ClientRequest<String, String> = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        let effects = backup.on_message(prepare(String::from("a"), 1, 10, req));
+
+        let snapshot = backup.snapshot();
+        assert_eq!(snapshot.op_number, 1);
+        assert_eq!(snapshot.log.len(), 1);
+        assert_eq!(snapshot.commit_number, 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+
+        let committed: Vec<usize> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Committed { op, .. } => Some(*op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(committed, vec![1]);
+    }
+
+    #[test]
+    fn duplicate_prepare_does_not_append_or_execute_twice() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 1, req.clone()));
+        let duplicate_effects = backup.on_message(prepare(String::from("a"), 1, 1, req));
+
+        let snapshot = backup.snapshot();
+        assert_eq!(snapshot.op_number, 1);
+        assert_eq!(snapshot.log.len(), 1);
+        assert_eq!(snapshot.commit_number, 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+        assert!(duplicate_effects.is_empty());
     }
 
     fn request(client_id: u64, request_number: usize, op: &str) -> Message<String, String> {
