@@ -93,12 +93,20 @@ where
                 view_number,
                 commit_number,
             } => self.on_commit(commit_number, view_number),
-            m => panic!("unexpected message: {:?}", m),
+            m => {
+                debug!(
+                    ?m,
+                    replica_number = self.replica_number,
+                    "no mapped message"
+                );
+
+                return Vec::new();
+            }
         }
     }
 
     fn on_request(&mut self, request: ClientRequest<Input, Output>) -> Vec<Effect<Input, Output>> {
-        if !self.is_primary() {
+        if self.status != Status::Normal || !self.is_primary() {
             return Vec::new();
         }
 
@@ -164,8 +172,8 @@ where
         op_number: usize,
         commit_number: usize,
     ) -> Vec<Effect<Input, Output>> {
-        if !self.is_same_view(view_number) {
-            return vec![];
+        if self.status != Status::Normal || self.is_primary() || !self.is_same_view(view_number) {
+            return Vec::new();
         }
 
         let mut effects = vec![];
@@ -213,7 +221,15 @@ where
         replica_number: ReplicaId,
         op_number: usize,
     ) -> Vec<Effect<Input, Output>> {
-        if !self.is_same_view(view_number) || !self.is_primary() {
+        if self.status != Status::Normal
+            || !self.is_primary()
+            || !self.is_same_view(view_number)
+            || op_number > self.op_number
+        {
+            return Vec::new();
+        }
+
+        if !self.configuration.contains(&replica_number) {
             return Vec::new();
         }
 
@@ -246,7 +262,7 @@ where
         commit_number: usize,
         view_number: ReplicaId,
     ) -> Vec<Effect<Input, Output>> {
-        if !self.is_same_view(view_number) || self.is_primary() {
+        if self.status != Status::Normal || self.is_primary() || !self.is_same_view(view_number) {
             return Vec::new();
         }
 
@@ -1019,6 +1035,150 @@ mod tests {
         assert_eq!(primary.snapshot().commit_number, 0);
         assert!(sm.borrow().applied.is_empty());
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn non_normal_primary_ignores_request() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+        primary.status = Status::ViewChange;
+        let before = primary.snapshot();
+
+        let effects = primary.on_message(request(10, 7, "a"));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot(), before);
+        assert!(primary.client_table.is_empty());
+        assert!(primary.op_ack_table.is_empty());
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn primary_ignores_prepare() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+        let before = primary.snapshot();
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        let effects = primary.on_message(prepare(String::from("a"), 1, 0, req));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot(), before);
+        assert!(primary.client_table.is_empty());
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn non_normal_backup_ignores_prepare() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        backup.status = Status::Recovering;
+        let before = backup.snapshot();
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        let effects = backup.on_message(prepare(String::from("a"), 1, 0, req));
+
+        assert!(effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(backup.client_table.is_empty());
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn non_normal_primary_ignores_prepare_ok() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+        primary.on_message(request(10, 7, "a"));
+        primary.status = Status::ViewChange;
+        let before = primary.snapshot();
+        let ack_table_before = primary.op_ack_table.clone();
+
+        let effects = primary.on_message(prepare_ok(1, 1));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot(), before);
+        assert_eq!(primary.op_ack_table, ack_table_before);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn non_normal_backup_ignores_commit() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+        backup.on_message(prepare(String::from("a"), 1, 0, req));
+        backup.status = Status::Recovering;
+        let before = backup.snapshot();
+
+        let effects = backup.on_message(commit(0, 1));
+
+        assert!(effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn ahead_prepare_ok_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+        primary.on_message(request(10, 7, "a"));
+        let before = primary.snapshot();
+        let ack_table_before = primary.op_ack_table.clone();
+
+        let effects = primary.on_message(prepare_ok(1, 2));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot(), before);
+        assert_eq!(primary.op_ack_table, ack_table_before);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn prepare_ok_from_non_member_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+        primary.on_message(request(10, 7, "a"));
+        let before = primary.snapshot();
+        let ack_table_before = primary.op_ack_table.clone();
+
+        let effects = primary.on_message(prepare_ok(99, 1));
+
+        assert!(effects.is_empty());
+        assert_eq!(primary.snapshot(), before);
+        assert_eq!(primary.op_ack_table, ack_table_before);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn unexpected_message_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut replica = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let before = replica.snapshot();
+
+        let effects = replica.on_message(Message::Error {
+            message: String::from("unexpected"),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(replica.snapshot(), before);
+        assert!(replica.client_table.is_empty());
+        assert!(replica.op_ack_table.is_empty());
+        assert!(sm.borrow().applied.is_empty());
     }
 
     fn request(client_id: u64, request_number: usize, op: &str) -> Message<String, String> {
