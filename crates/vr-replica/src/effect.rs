@@ -1,7 +1,7 @@
 use crate::message::Message;
 use crate::types::{OpNumber, ReplicaId};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Effect<I, O> {
     Send {
         to: ReplicaId,

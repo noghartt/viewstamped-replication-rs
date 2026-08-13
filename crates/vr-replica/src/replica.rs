@@ -153,7 +153,6 @@ where
             .collect()
     }
 
-    // TODO: Add the implementation for the State Transfer
     fn on_prepare(
         &mut self,
         request: Box<ClientRequest<Input, Output>>,
@@ -168,13 +167,26 @@ where
         let mut effects = vec![];
 
         if self.log.len() + 1 == op_number {
-            self.log.push((op_number, *request));
+            debug_assert_eq!(self.op_number, self.log.len());
+
+            self.log.push((op_number, *request.clone()));
             effects.push(Effect::Prepared {
                 replica: self.replica_number,
                 op: op_number,
             });
 
-            self.commit_number = commit_number;
+            self.op_number = op_number;
+            self.client_table.insert(request.client_id, *request);
+
+            let target = commit_number.min(self.log.len());
+            let committed = self.commit_up_to(target);
+
+            committed.iter().for_each(|(op_number, _, _)| {
+                effects.push(Effect::Committed {
+                    replica: self.replica_number,
+                    op: *op_number,
+                })
+            });
 
             let prepare_ok = Message::PrepareOk {
                 view_number: self.view_number,
@@ -209,7 +221,7 @@ where
 
         committed
             .into_iter()
-            .map(|(result, request)| {
+            .map(|(_, result, request)| {
                 let reply = Message::Reply {
                     client_id: request.client_id.clone(),
                     view_number: self.view_number,
@@ -265,7 +277,7 @@ where
     }
 
     // TODO: Validate if it needs to do more operations here
-    fn commit_op(&mut self, op_number: OpNumber) -> (Output, ClientRequest<Input, Output>) {
+    fn commit_op(&mut self, op_number: OpNumber) -> (usize, Output, ClientRequest<Input, Output>) {
         debug_assert_eq!(op_number, self.commit_number + 1);
 
         let (_, request) = self.log.get(op_number - 1).unwrap();
@@ -280,7 +292,7 @@ where
         self.commit_number = op_number;
         self.client_table.insert(request.client_id, request.clone());
 
-        (result, request)
+        (op_number, result, request)
     }
 
     fn ack_request(&mut self, replica_number: u64, op_number: usize) {
@@ -300,7 +312,10 @@ where
         acked_ops[self.get_quorum() - 1]
     }
 
-    fn commit_up_to(&mut self, target: usize) -> Vec<(Output, ClientRequest<Input, Output>)> {
+    fn commit_up_to(
+        &mut self,
+        target: usize,
+    ) -> Vec<(usize, Output, ClientRequest<Input, Output>)> {
         let mut committed = vec![];
         while self.commit_number < target {
             committed.push(self.commit_op(self.commit_number + 1));
@@ -593,6 +608,124 @@ mod tests {
         assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
     }
 
+    #[test]
+    fn backup_updates_state_after_appending_prepare() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+
+        let req: ClientRequest<String, String> = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        let eff = backup.on_message(prepare(String::from("a"), 1, 0, req.clone()));
+
+        assert_eq!(eff.len(), 2);
+
+        let first_effect = eff.first().unwrap();
+        assert_eq!(*first_effect, Effect::Prepared { op: 1, replica: 1 });
+
+        let last_effect = eff.last().unwrap();
+        assert_eq!(
+            *last_effect,
+            Effect::Send {
+                to: 0,
+                message: Message::PrepareOk {
+                    view_number: 0,
+                    replica_number: 1,
+                    op_number: 1,
+                }
+            }
+        );
+
+        assert_eq!(backup.log.len(), 1);
+        assert_eq!(backup.op_number, 1);
+        assert_eq!(backup.commit_number, 0);
+        assert_eq!(backup.client_table.get(&1), Some(&req));
+    }
+
+    #[test]
+    fn backup_executes_piggybacked_commit_range_in_order() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+
+        let req: ClientRequest<String, String> = ClientRequest {
+            client_id: 1,
+            op: String::from("a"),
+            request_number: 1,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req.clone()));
+        backup.on_message(prepare(
+            String::from("b"),
+            2,
+            0,
+            ClientRequest {
+                op: String::from("b"),
+                client_id: 20,
+                ..req.clone()
+            },
+        ));
+
+        let effects = backup.on_message(prepare(
+            String::from("c"),
+            3,
+            2,
+            ClientRequest {
+                op: String::from("c"),
+                client_id: 30,
+                ..req
+            },
+        ));
+
+        let snapshot = backup.snapshot();
+
+        assert_eq!(snapshot.op_number, 3);
+        assert_eq!(snapshot.log.len(), 3);
+        assert_eq!(snapshot.commit_number, 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+
+        let committed: Vec<usize> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Committed { op, .. } => Some(*op),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(committed, vec![1, 2]);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Reply { .. }))
+        );
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Prepared { op: 3, .. }))
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(
+                    effect,
+                    Effect::Send {
+                        message: Message::PrepareOk { op_number: 3, .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
     fn request(client_id: u64, request_number: usize, op: &str) -> Message<String, String> {
         Message::Request(ClientRequest {
             op: op.to_string(),
@@ -600,6 +733,21 @@ mod tests {
             request_number,
             result: None,
         })
+    }
+
+    fn prepare<I, O>(
+        op: I,
+        op_number: usize,
+        commit_number: usize,
+        request: ClientRequest<I, O>,
+    ) -> Message<I, O> {
+        Message::Prepare {
+            op: op,
+            view_number: 0,
+            op_number,
+            commit_number: commit_number,
+            request: Box::new(request),
+        }
     }
 
     fn prepare_ok(replica_number: ReplicaId, op_number: usize) -> Message<String, String> {
