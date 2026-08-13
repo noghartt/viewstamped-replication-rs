@@ -1,4 +1,4 @@
-use crate::types::ReplicaId;
+use crate::types::{OpNumber, ReplicaId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientRequest<I, O> {
@@ -36,5 +36,9 @@ pub enum Message<I, O> {
         view_number: ReplicaId,
         replica_number: ReplicaId,
         op_number: usize,
+    },
+    Commit {
+        view_number: ReplicaId,
+        commit_number: OpNumber,
     },
 }

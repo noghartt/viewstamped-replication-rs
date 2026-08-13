@@ -102,6 +102,10 @@ fn message_label<I: fmt::Debug, O: fmt::Debug>(message: &Message<I, O>) -> Strin
             replica_number,
             ..
         } => format!("PrepareOk(op={op_number}, from=R{replica_number})"),
+        Message::Commit {
+            view_number,
+            commit_number,
+        } => format!("Commit(op={commit_number}, view_number={view_number})"),
     }
 }
 

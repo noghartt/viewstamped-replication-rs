@@ -89,6 +89,10 @@ where
                 replica_number,
                 op_number,
             } => self.on_prepare_ok(view_number, replica_number, op_number),
+            Message::Commit {
+                view_number,
+                commit_number,
+            } => self.on_commit(commit_number, view_number),
             m => panic!("unexpected message: {:?}", m),
         }
     }
@@ -239,7 +243,6 @@ where
 
     fn on_commit(
         &mut self,
-        op_number: OpNumber,
         commit_number: usize,
         view_number: ReplicaId,
     ) -> Vec<Effect<Input, Output>> {
@@ -247,16 +250,15 @@ where
             return Vec::new();
         }
 
-        if op_number == self.op_number {
-            return Vec::new();
-        }
+        let target = commit_number.min(self.log.len());
 
-        self.commit_op(op_number);
-
-        vec![Effect::Committed {
-            replica: self.replica_number,
-            op: op_number,
-        }]
+        self.commit_up_to(target)
+            .into_iter()
+            .map(|(op_number, _, _)| Effect::Committed {
+                replica: self.replica_number,
+                op: op_number,
+            })
+            .collect()
     }
 
     #[inline]
@@ -860,6 +862,165 @@ mod tests {
         assert!(duplicate_effects.is_empty());
     }
 
+    #[test]
+    fn commit_executes_available_prefix() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req.clone()));
+        backup.on_message(prepare(
+            String::from("b"),
+            2,
+            0,
+            ClientRequest {
+                client_id: 20,
+                op: String::from("b"),
+                ..req
+            },
+        ));
+
+        let effects = backup.on_message(commit(0, 2));
+
+        assert_eq!(backup.snapshot().commit_number, 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            backup
+                .client_table
+                .get(&10)
+                .and_then(|request| request.result.as_deref()),
+            Some("applied-a")
+        );
+        assert_eq!(
+            backup
+                .client_table
+                .get(&20)
+                .and_then(|request| request.result.as_deref()),
+            Some("applied-b")
+        );
+
+        let committed: Vec<usize> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Committed { op, .. } => Some(*op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(committed, vec![1, 2]);
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Reply { .. }))
+        );
+    }
+
+    #[test]
+    fn duplicate_commit_is_no_op() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req));
+        backup.on_message(commit(0, 1));
+        let duplicate_effects = backup.on_message(commit(0, 1));
+
+        assert_eq!(backup.snapshot().commit_number, 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+        assert!(duplicate_effects.is_empty());
+    }
+
+    #[test]
+    fn stale_commit_does_not_regress_backup() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req.clone()));
+        backup.on_message(prepare(
+            String::from("b"),
+            2,
+            0,
+            ClientRequest {
+                client_id: 20,
+                op: String::from("b"),
+                ..req
+            },
+        ));
+        backup.on_message(commit(0, 2));
+        let stale_effects = backup.on_message(commit(0, 1));
+
+        assert_eq!(backup.snapshot().commit_number, 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+        assert!(stale_effects.is_empty());
+    }
+
+    #[test]
+    fn commit_beyond_log_is_clamped() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req));
+        let effects = backup.on_message(commit(0, 10));
+
+        assert_eq!(backup.snapshot().commit_number, 1);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+        assert_eq!(effects, vec![Effect::Committed { replica: 1, op: 1 }]);
+    }
+
+    #[test]
+    fn wrong_view_commit_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req));
+        let effects = backup.on_message(commit(1, 1));
+
+        assert_eq!(backup.snapshot().commit_number, 0);
+        assert!(sm.borrow().applied.is_empty());
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn primary_ignores_commit() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm.clone());
+
+        primary.on_message(request(10, 7, "a"));
+        let effects = primary.on_message(commit(0, 1));
+
+        assert_eq!(primary.snapshot().op_number, 1);
+        assert_eq!(primary.snapshot().commit_number, 0);
+        assert!(sm.borrow().applied.is_empty());
+        assert!(effects.is_empty());
+    }
+
     fn request(client_id: u64, request_number: usize, op: &str) -> Message<String, String> {
         Message::Request(ClientRequest {
             op: op.to_string(),
@@ -889,6 +1050,13 @@ mod tests {
             view_number: 0,
             replica_number,
             op_number,
+        }
+    }
+
+    fn commit(view_number: ReplicaId, commit_number: OpNumber) -> Message<String, String> {
+        Message::Commit {
+            view_number,
+            commit_number,
         }
     }
 
