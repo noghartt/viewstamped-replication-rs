@@ -4,7 +4,7 @@ use vr_replica::message::Message;
 
 use crate::types::NodeId;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Set(String, u64),
     Get(String, Option<u64>),

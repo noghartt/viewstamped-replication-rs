@@ -48,7 +48,7 @@ where
 
 impl<Input, Output> Replica<Input, Output>
 where
-    Input: Clone + std::fmt::Debug,
+    Input: Clone + PartialEq + std::fmt::Debug,
     Output: Clone + std::fmt::Debug,
 {
     pub fn new(
@@ -78,12 +78,12 @@ where
         match message {
             Message::Request { 0: request } => self.on_request(request),
             Message::Prepare {
-                op: _,
+                op,
                 view_number,
                 op_number,
                 commit_number,
                 request,
-            } => self.on_prepare(request, view_number, op_number, commit_number),
+            } => self.on_prepare(op, request, view_number, op_number, commit_number),
             Message::PrepareOk {
                 view_number,
                 replica_number,
@@ -167,12 +167,17 @@ where
 
     fn on_prepare(
         &mut self,
+        op: Input,
         request: Box<ClientRequest<Input, Output>>,
         view_number: ReplicaId,
         op_number: usize,
         commit_number: usize,
     ) -> Vec<Effect<Input, Output>> {
         if self.status != Status::Normal || self.is_primary() || !self.is_same_view(view_number) {
+            return Vec::new();
+        }
+
+        if op != request.op {
             return Vec::new();
         }
 
@@ -210,6 +215,22 @@ where
                 to: self.view_number,
                 message: prepare_ok,
             });
+        } else if op_number <= self.log.len() {
+            let (_, stored) = &self.log[op_number - 1];
+            let matches = stored.client_id == request.client_id
+                && stored.request_number == request.request_number
+                && stored.op == request.op;
+
+            if matches {
+                effects.push(Effect::Send {
+                    to: self.view_number,
+                    message: Message::PrepareOk {
+                        view_number: self.view_number,
+                        replica_number: self.replica_number,
+                        op_number,
+                    },
+                });
+            }
         }
 
         effects
@@ -875,7 +896,97 @@ mod tests {
         assert_eq!(snapshot.log.len(), 1);
         assert_eq!(snapshot.commit_number, 1);
         assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
-        assert!(duplicate_effects.is_empty());
+        assert_eq!(
+            duplicate_effects,
+            vec![Effect::Send {
+                to: 0,
+                message: Message::PrepareOk {
+                    view_number: 0,
+                    replica_number: 1,
+                    op_number: 1,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn conflicting_duplicate_prepare_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let req = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 7,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, req));
+        let before = backup.snapshot();
+        let effects = backup.on_message(prepare(
+            String::from("conflict"),
+            1,
+            0,
+            ClientRequest {
+                client_id: 10,
+                op: String::from("conflict"),
+                request_number: 7,
+                result: None,
+            },
+        ));
+
+        assert!(effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn prepare_with_log_gap_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let before = backup.snapshot();
+
+        let effects = backup.on_message(prepare(
+            String::from("b"),
+            2,
+            0,
+            ClientRequest {
+                client_id: 20,
+                op: String::from("b"),
+                request_number: 7,
+                result: None,
+            },
+        ));
+
+        assert!(effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(backup.client_table.is_empty());
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn prepare_with_mismatched_operation_fields_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let before = backup.snapshot();
+        let message = Message::Prepare {
+            op: String::from("outer"),
+            view_number: 0,
+            op_number: 1,
+            commit_number: 0,
+            request: Box::new(ClientRequest {
+                client_id: 10,
+                op: String::from("inner"),
+                request_number: 7,
+                result: None,
+            }),
+        };
+
+        let effects = backup.on_message(message);
+
+        assert!(effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(backup.client_table.is_empty());
+        assert!(sm.borrow().applied.is_empty());
     }
 
     #[test]
