@@ -57,11 +57,11 @@ struct CliConfig {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     clients: u64,
 
-    #[arg(long = "max-time")]
-    run_until_max_time: Option<u64>,
+    #[arg(long = "max-time", default_value_t = 60_000)]
+    run_until_max_time: u64,
 
-    #[arg(long = "max-events")]
-    run_until_max_events: Option<u64>,
+    #[arg(long = "max-events", default_value_t = 50_000)]
+    run_until_max_events: u64,
 
     #[arg(default_value_t = 1)]
     link_base_ms: u64,
@@ -80,6 +80,9 @@ struct CliConfig {
 
     #[arg(long, default_value_t = false)]
     history: bool,
+
+    #[arg(long, default_value_t = 100)]
+    heartbeat_interval: u64,
 }
 
 enum Mode {
@@ -145,6 +148,7 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
         disable_timers: config.disable_timers,
         run_until_max_time: config.run_until_max_time,
         run_until_max_events: config.run_until_max_events,
+        heartbeat_interval: config.heartbeat_interval,
     };
 
     let mut simulator = Simulator::with_seed(seed, Some(simulator_config));
@@ -164,6 +168,7 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
     }
 
     simulator.create_network_mesh();
+    simulator.start_timers();
 
     start_seeded_workload(&mut simulator, &client_ids);
 

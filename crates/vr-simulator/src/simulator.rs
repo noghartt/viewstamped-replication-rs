@@ -5,7 +5,7 @@ use tracing::{debug, info, trace};
 
 use vr_replica::effect::Effect;
 use vr_replica::message::{ClientRequest, Message};
-use vr_replica::replica::Replica;
+use vr_replica::replica::{Replica, Status};
 
 use crate::client::{Client, Op};
 use crate::history::{History, RuntimeEvents};
@@ -44,6 +44,9 @@ enum WheelEvent<Input> {
         request_number: usize,
         op: Input,
     },
+    HeartbeatTick {
+        node: NodeId,
+    },
 }
 
 impl<Input> WheelEvent<Input> {
@@ -51,15 +54,28 @@ impl<Input> WheelEvent<Input> {
         match self {
             WheelEvent::ClientRequest { .. } => EventClass::ClientRequest,
             WheelEvent::Deliver { .. } => EventClass::Delivery,
+            Self::HeartbeatTick { .. } => EventClass::Timer,
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SimulatorConfig {
     pub disable_timers: bool,
-    pub run_until_max_time: Option<u64>,
-    pub run_until_max_events: Option<u64>,
+    pub run_until_max_time: u64,
+    pub run_until_max_events: u64,
+    pub heartbeat_interval: u64,
+}
+
+impl Default for SimulatorConfig {
+    fn default() -> Self {
+        Self {
+            disable_timers: false,
+            run_until_max_time: 60_000,
+            run_until_max_events: 50_000,
+            heartbeat_interval: 100,
+        }
+    }
 }
 
 /// This is the key that maps each event on wheel. It composes by:
@@ -118,20 +134,12 @@ impl Simulator<Op> {
                 return Ok(SimulatorRunOutcome::Quiesced);
             };
 
-            if self
-                .config
-                .run_until_max_time
-                .is_some_and(|max| next_at > max)
-            {
-                return Ok(SimulatorRunOutcome::TimeLimit);
+            if self.events_processed >= self.config.run_until_max_events {
+                return Ok(SimulatorRunOutcome::EventLimit);
             }
 
-            if self
-                .config
-                .run_until_max_events
-                .is_some_and(|max| self.events_processed >= max)
-            {
-                return Ok(SimulatorRunOutcome::EventLimit);
+            if next_at > self.config.run_until_max_time {
+                return Ok(SimulatorRunOutcome::TimeLimit);
             }
 
             self.step()?;
@@ -166,6 +174,7 @@ impl Simulator<Op> {
                 op,
             } => self.client_request(client_id, request_number, op),
             WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message)?,
+            WheelEvent::HeartbeatTick { node } => self.heartbeat_tick(node),
         }
 
         Ok(())
@@ -419,6 +428,80 @@ impl Simulator<Op> {
 
         debug_assert!(replaced.is_none())
     }
+
+    fn heartbeat_tick(&mut self, node: NodeId) {
+        if self.config.disable_timers {
+            return;
+        }
+
+        let Some(replica) = self.replicas.get(&node) else {
+            debug!(?node, "heartbeat for unknown replica ignored");
+            return;
+        };
+
+        let snapshot = replica.snapshot();
+        if snapshot.status != Status::Normal {
+            return;
+        }
+
+        let replicas: Vec<NodeId> = self.replicas.keys().copied().collect();
+        if replicas.is_empty() {
+            return;
+        }
+
+        let primary_index = (snapshot.view_number % replicas.len() as u64) as usize;
+        let primary = replicas[primary_index];
+
+        // This may be an old timer belonging to a former primary.
+        if node != primary {
+            return;
+        }
+
+        let commit = Message::Commit {
+            view_number: snapshot.view_number,
+            commit_number: snapshot.commit_number,
+        };
+
+        for backup in replicas.into_iter().filter(|replica| *replica != node) {
+            self.send(
+                NodeKind::Replica(node),
+                NodeKind::Replica(backup),
+                commit.clone(),
+            );
+        }
+
+        let next_at = self
+            .now
+            .checked_add(self.config.heartbeat_interval)
+            .expect("virtual time overflow while scheduling heartbeat");
+        self.schedule_event(next_at, WheelEvent::HeartbeatTick { node });
+    }
+
+    pub fn start_timers(&mut self) {
+        if self.config.disable_timers {
+            return;
+        }
+
+        assert!(
+            self.config.heartbeat_interval > 0,
+            "heartbeat interval must be greater than zero"
+        );
+
+        let replicas: Vec<NodeId> = self.replicas.keys().copied().collect();
+
+        if replicas.is_empty() {
+            return;
+        }
+
+        let primary = replicas[0];
+
+        let at = self
+            .now
+            .checked_add(self.config.heartbeat_interval)
+            .expect("virtual time overflow while scheduling initial heartbeat");
+
+        self.schedule_event(at, WheelEvent::HeartbeatTick { node: primary });
+    }
 }
 
 #[cfg(test)]
@@ -472,7 +555,7 @@ mod tests {
     #[test]
     fn hit_event_limit_with_max_events_zero() {
         let config = SimulatorConfig {
-            run_until_max_events: Some(0),
+            run_until_max_events: 0,
             ..Default::default()
         };
         let mut s = setup(42, 3, Some(config));
@@ -484,9 +567,26 @@ mod tests {
     }
 
     #[test]
+    fn event_limit_takes_priority_over_time_limit() {
+        let config = SimulatorConfig {
+            run_until_max_time: 0,
+            run_until_max_events: 0,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.schedule_event(1, WheelEvent::HeartbeatTick { node: NodeId(0) });
+
+        let outcome = sim.run().unwrap();
+
+        assert_eq!(outcome, SimulatorRunOutcome::EventLimit);
+        assert_eq!(sim.events_processed, 0);
+        assert_eq!(sim.now, 0);
+    }
+
+    #[test]
     fn validate_event_execute_on_max_time_limit() {
         let config = SimulatorConfig {
-            run_until_max_time: Some(10),
+            run_until_max_time: 10,
             ..Default::default()
         };
         let mut s = setup(42, 3, Some(config));
@@ -527,7 +627,7 @@ mod tests {
     #[test]
     fn hit_time_limit_when_max_time_reaches() {
         let config = SimulatorConfig {
-            run_until_max_time: Some(2),
+            run_until_max_time: 2,
             ..Default::default()
         };
         let mut s = setup(42, 3, Some(config));
@@ -667,7 +767,7 @@ mod tests {
     #[test]
     fn quiescence_wins_when_last_allowed_event_drains_wheel() {
         let config = SimulatorConfig {
-            run_until_max_events: Some(2),
+            run_until_max_events: 2,
             ..Default::default()
         };
 
@@ -696,7 +796,7 @@ mod tests {
     #[test]
     fn event_limit_leaves_remaining_event_pending() {
         let config = SimulatorConfig {
-            run_until_max_events: Some(2),
+            run_until_max_events: 2,
             ..Default::default()
         };
 
@@ -725,7 +825,7 @@ mod tests {
     #[test]
     fn enforce_hard_stop_after_hitting_max_event() {
         let config = SimulatorConfig {
-            run_until_max_events: Some(5),
+            run_until_max_events: 5,
             ..Default::default()
         };
         let mut s = setup(42, 3, Some(config));
@@ -805,5 +905,158 @@ mod tests {
         assert_eq!(client.replies_received, 1);
         assert_eq!(client.request_number, 1);
         assert_eq!(client.state.get("k"), Some(&7));
+    }
+
+    #[test]
+    fn heartbeat_sends_commit_to_every_backup() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+
+        sim.step().unwrap();
+
+        let commits: Vec<(NodeKind, NodeKind, u64, usize)> = sim
+            .history
+            .events()
+            .iter()
+            .filter_map(|(_, event)| {
+                let RuntimeEvents::NetworkRequest {
+                    from,
+                    to,
+                    message:
+                        Message::Commit {
+                            view_number,
+                            commit_number,
+                        },
+                    ..
+                } = event
+                else {
+                    return None;
+                };
+
+                Some((*from, *to, *view_number, *commit_number))
+            })
+            .collect();
+
+        assert_eq!(
+            commits,
+            vec![
+                (
+                    NodeKind::Replica(NodeId(0)),
+                    NodeKind::Replica(NodeId(1)),
+                    0,
+                    0,
+                ),
+                (
+                    NodeKind::Replica(NodeId(0)),
+                    NodeKind::Replica(NodeId(2)),
+                    0,
+                    0,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_timers_schedule_no_heartbeat() {
+        let config = SimulatorConfig {
+            disable_timers: true,
+            heartbeat_interval: 10,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+
+        sim.start_timers();
+
+        assert!(sim.wheel.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_reschedules_itself() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+
+        sim.step().unwrap();
+
+        assert_eq!(sim.now, 10);
+        assert!(sim.wheel.iter().any(|(&(at, class, _), event)| {
+            at == 20
+                && class == EventClass::Timer
+                && matches!(event, WheelEvent::HeartbeatTick { node: NodeId(0) })
+        }));
+    }
+
+    #[test]
+    fn event_limit_stops_periodic_heartbeats() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            run_until_max_events: 3,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 1, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+
+        let outcome = sim.run().unwrap();
+
+        assert_eq!(outcome, SimulatorRunOutcome::EventLimit);
+        assert_eq!(sim.events_processed, 3);
+        assert_eq!(sim.now, 30);
+        assert_eq!(sim.wheel.len(), 1);
+    }
+
+    #[test]
+    fn time_limit_does_not_execute_late_heartbeat() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            run_until_max_time: 25,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 1, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+
+        let outcome = sim.run().unwrap();
+
+        assert_eq!(outcome, SimulatorRunOutcome::TimeLimit);
+        assert_eq!(sim.events_processed, 2);
+        assert_eq!(sim.now, 20);
+        assert!(sim.wheel.keys().any(|(at, _, _)| *at == 30));
+    }
+
+    #[test]
+    fn heartbeat_converges_backups_to_final_commit() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+        sim.start_timers();
+
+        let outcome = sim.run().unwrap();
+
+        assert_eq!(outcome, SimulatorRunOutcome::TimeLimit);
+        for replica in sim.replicas.values() {
+            let snapshot = replica.snapshot();
+            assert_eq!(snapshot.op_number, 1);
+            assert_eq!(snapshot.commit_number, 1);
+            assert_eq!(snapshot.log.len(), 1);
+        }
+
+        let clients = sim.get_clients();
+        assert_eq!(clients[0].replies_received, 1);
+        assert_eq!(clients[0].state.get("k"), Some(&7));
     }
 }
