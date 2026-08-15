@@ -83,6 +83,9 @@ struct CliConfig {
 
     #[arg(long, default_value_t = 100)]
     heartbeat_interval: u64,
+
+    #[arg(long, default_value_t = 1_000)]
+    client_retry_interval: u64,
 }
 
 enum Mode {
@@ -149,7 +152,13 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
         run_until_max_time: config.run_until_max_time,
         run_until_max_events: config.run_until_max_events,
         heartbeat_interval: config.heartbeat_interval,
+        client_retry_interval: config.client_retry_interval,
     };
+
+    assert!(
+        config.client_retry_interval > 0,
+        "client retry interval must be nonzero"
+    );
 
     let mut simulator = Simulator::with_seed(seed, Some(simulator_config));
     let replica_ids = replica_ids(config.replicas);

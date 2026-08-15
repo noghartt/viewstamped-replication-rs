@@ -40,6 +40,11 @@ pub enum RuntimeEvents<
         request_number: usize,
         result: Output,
     },
+    ClientRetried {
+        client: NodeId,
+        request_number: usize,
+        generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -206,6 +211,17 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                         f,
                         "[t={at:>5}]   C{:?} request_number={request_number} result={:?}",
                         client, result,
+                    )?;
+                }
+                RuntimeEvents::ClientRetried {
+                    client,
+                    request_number,
+                    generation,
+                } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]   C{:?} request_number={request_number} generation={generation}",
+                        client,
                     )?;
                 }
             }

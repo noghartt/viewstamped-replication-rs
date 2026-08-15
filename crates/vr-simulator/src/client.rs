@@ -11,6 +11,13 @@ pub enum Op {
     Del(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRequest {
+    pub request_number: usize,
+    pub op: Op,
+    pub retry_generation: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Client {
     pub id: NodeId,
@@ -25,7 +32,9 @@ pub struct Client {
     pub request_number: usize,
     /// The current epoch number of the replica group.
     pub epoch: usize,
-    pending_request: Option<usize>,
+
+    pending_request: Option<PendingRequest>,
+    next_retry_generation: u64,
 }
 
 impl Client {
@@ -39,6 +48,7 @@ impl Client {
             request_number: 0,
             epoch: 0,
             pending_request: None,
+            next_retry_generation: 0,
         }
     }
 
@@ -46,56 +56,70 @@ impl Client {
         self.configuration[(self.current_view as usize) % self.configuration.len()]
     }
 
+    pub fn try_begin_request(&mut self, op: Op) -> Option<PendingRequest> {
+        if self.pending_request.is_some() {
+            return None;
+        }
+
+        let request_number = self
+            .request_number
+            .checked_add(1)
+            .expect("client request number overflow");
+        let pending = PendingRequest {
+            request_number,
+            op,
+            retry_generation: self.next_retry_generation,
+        };
+
+        self.next_retry_generation = self
+            .next_retry_generation
+            .checked_add(1)
+            .expect("client retry generation overflow");
+
+        self.pending_request = Some(pending.clone());
+        Some(pending)
+    }
+
     pub fn on_message<I: std::fmt::Debug>(
         &mut self,
         message: Message<I, Op>,
     ) -> Option<(usize, Op)> {
-        match message {
-            Message::Reply {
-                result,
-                client_id,
-                request_id,
-                ..
-            } => {
-                if client_id != self.id.0 {
-                    return None;
-                }
-
-                let Some(pending_request) = self.pending_request else {
-                    return None;
-                };
-
-                if request_id != pending_request {
-                    return None;
-                }
-
-                let op = result?;
-
-                self.request_number = pending_request;
-                self.pending_request = None;
-                self.replies_received += 1;
-
-                self.apply_op(op.clone());
-
-                Some((request_id, op))
-            }
+        let Message::Reply {
+            result,
+            client_id,
+            request_id,
+            ..
+        } = message
+        else {
             // VR's rule for unexpected messages is ignore-and-drop; a panic
             // here would kill an entire seed campaign on one stray message.
-            other => {
-                tracing::debug!(?other, "client ignoring unexpected message");
-                None
-            }
+            tracing::debug!(?message, "client ignoring unexpected message");
+            return None;
+        };
+
+        let pending = self.pending_request.as_ref()?;
+        if client_id != self.id.0 || request_id != pending.request_number {
+            return None;
         }
+
+        let result = result?;
+        let request_number = pending.request_number;
+
+        self.request_number = request_number;
+        self.pending_request = None;
+        self.replies_received += 1;
+        self.apply_op(result.clone());
+
+        Some((request_number, result))
     }
 
-    pub fn lock_request_number(&mut self) -> usize {
-        if let Some(request_number) = self.pending_request {
-            return request_number;
-        }
-
-        let request_number: usize = self.request_number + 1;
-        self.pending_request = Some(request_number);
-        request_number
+    pub fn pending_retry(&self, request_number: usize, generation: u64) -> Option<PendingRequest> {
+        self.pending_request
+            .as_ref()
+            .filter(|pending| {
+                pending.request_number == request_number && pending.retry_generation == generation
+            })
+            .cloned()
     }
 
     pub fn has_pending_request(&self) -> bool {
@@ -119,61 +143,58 @@ impl Client {
 mod tests {
     use super::*;
 
+    fn begin(client: &mut Client, op: Op) -> PendingRequest {
+        client.try_begin_request(op).expect("request should begin")
+    }
+
+    fn reply(client_id: u64, request_id: usize, result: Option<Op>) -> Message<Op, Op> {
+        Message::Reply {
+            client_id,
+            view_number: 0,
+            request_id,
+            result,
+        }
+    }
+
     #[test]
-    fn reserves_request_number_when_no_request_is_pending() {
+    fn begins_request_when_none_is_pending() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let op = Op::Set("k".into(), 1);
 
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 0);
+        let pending = begin(&mut client, op.clone());
 
-        client.lock_request_number();
-
-        assert_eq!(client.pending_request, Some(1));
+        assert_eq!(pending.request_number, 1);
+        assert_eq!(pending.op, op);
+        assert_eq!(pending.retry_generation, 0);
+        assert_eq!(client.pending_request, Some(pending));
         assert_eq!(client.request_number, 0);
     }
 
     #[test]
-    fn does_not_reserve_second_request_while_pending() {
+    fn does_not_begin_second_request_while_pending() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let pending = begin(&mut client, Op::Set("first".into(), 1));
 
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 0);
-
-        let next_request_number = client.lock_request_number();
-
-        assert_eq!(client.pending_request, Some(1));
-        assert_eq!(next_request_number, 1);
-        assert_eq!(client.request_number, 0);
-
-        let next_request_number = client.lock_request_number();
-
-        assert_eq!(client.pending_request, Some(1));
-        assert_eq!(next_request_number, 1);
+        assert!(
+            client
+                .try_begin_request(Op::Set("second".into(), 2))
+                .is_none()
+        );
+        assert_eq!(client.pending_request, Some(pending));
         assert_eq!(client.request_number, 0);
     }
 
     #[test]
     fn accepts_matching_reply_and_clears_pending_request() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
-
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 0);
-
-        let next_request_number = client.lock_request_number();
-
-        assert_eq!(client.pending_request, Some(1));
-        assert_eq!(next_request_number, 1);
-        assert_eq!(client.request_number, 0);
-
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 0,
-            view_number: 0,
-            request_id: next_request_number,
-            result: Some(Op::Set("k".into(), 1)),
-        };
+        let pending = begin(&mut client, Op::Set("k".into(), 1));
 
         assert_eq!(
-            client.on_message::<Op>(reply),
+            client.on_message::<Op>(reply(
+                0,
+                pending.request_number,
+                Some(Op::Set("k".into(), 1)),
+            )),
             Some((1, Op::Set("k".into(), 1)))
         );
 
@@ -186,25 +207,10 @@ mod tests {
     #[test]
     fn ignores_duplicate_reply() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
-
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 0);
-
-        let next_request_number = client.lock_request_number();
-
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 0,
-            view_number: 0,
-            request_id: next_request_number,
-            result: Some(Op::Set("k".into(), 1)),
-        };
+        let pending = begin(&mut client, Op::Set("k".into(), 1));
+        let reply = reply(0, pending.request_number, Some(Op::Set("k".into(), 1)));
 
         assert!(client.on_message::<Op>(reply.clone()).is_some());
-
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 1);
-        assert_eq!(client.replies_received, 1);
-
         assert!(client.on_message::<Op>(reply).is_none());
 
         assert_eq!(client.pending_request, None);
@@ -215,47 +221,31 @@ mod tests {
     #[test]
     fn ignores_reply_for_different_request() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let pending = begin(&mut client, Op::Set("k".into(), 1));
 
-        assert_eq!(client.pending_request, None);
+        assert!(
+            client
+                .on_message::<Op>(reply(0, 2, Some(Op::Set("k".into(), 1))))
+                .is_none()
+        );
+
+        assert_eq!(client.pending_request, Some(pending));
         assert_eq!(client.request_number, 0);
-        assert_eq!(client.replies_received, 0);
-
-        client.pending_request = Some(2);
-        client.request_number = 1;
-
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 0,
-            view_number: 0,
-            request_id: 1,
-            result: Some(Op::Set("k".into(), 1)),
-        };
-
-        assert!(client.on_message::<Op>(reply).is_none());
-
-        assert_eq!(client.pending_request, Some(2));
-        assert_eq!(client.request_number, 1);
         assert!(client.state.is_empty());
     }
 
     #[test]
     fn ignores_reply_for_different_client() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let pending = begin(&mut client, Op::Set("k".into(), 1));
 
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 0);
+        assert!(
+            client
+                .on_message::<Op>(reply(1, 1, Some(Op::Set("k".into(), 1))))
+                .is_none()
+        );
 
-        let next_request_number = client.lock_request_number();
-
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 1,
-            view_number: 0,
-            request_id: next_request_number,
-            result: Some(Op::Set("k".into(), 1)),
-        };
-
-        assert!(client.on_message::<Op>(reply).is_none());
-
-        assert_eq!(client.pending_request, Some(1));
+        assert_eq!(client.pending_request, Some(pending));
         assert_eq!(client.request_number, 0);
         assert!(client.state.is_empty());
     }
@@ -263,16 +253,14 @@ mod tests {
     #[test]
     fn ignores_matching_reply_without_result() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
-        let request_number = client.lock_request_number();
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 0,
-            view_number: 0,
-            request_id: request_number,
-            result: None,
-        };
+        let pending = begin(&mut client, Op::Set("k".into(), 1));
 
-        assert!(client.on_message::<Op>(reply).is_none());
-        assert_eq!(client.pending_request, Some(request_number));
+        assert!(
+            client
+                .on_message::<Op>(reply(0, pending.request_number, None))
+                .is_none()
+        );
+        assert_eq!(client.pending_request, Some(pending));
         assert_eq!(client.request_number, 0);
         assert_eq!(client.replies_received, 0);
         assert!(client.state.is_empty());
@@ -281,46 +269,46 @@ mod tests {
     #[test]
     fn allows_next_request_after_completion() {
         let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let first = begin(&mut client, Op::Set("k".into(), 1));
 
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 0);
+        assert!(
+            client
+                .on_message::<Op>(reply(0, first.request_number, Some(first.op)))
+                .is_some()
+        );
 
-        let next_request_number = client.lock_request_number();
-
-        assert_eq!(client.pending_request, Some(1));
-        assert_eq!(next_request_number, 1);
-        assert_eq!(client.request_number, 0);
-
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 0,
-            view_number: 0,
-            request_id: next_request_number,
-            result: Some(Op::Set("k".into(), 1)),
-        };
-
-        assert!(client.on_message::<Op>(reply).is_some());
-
-        assert_eq!(client.pending_request, None);
-        assert_eq!(client.request_number, 1);
-        assert_eq!(client.replies_received, 1);
-
-        let next_request_number = client.lock_request_number();
-
-        assert_eq!(client.pending_request, Some(2));
-        assert_eq!(next_request_number, 2);
-        assert_eq!(client.request_number, 1);
-
-        let reply = Message::<Op, Op>::Reply {
-            client_id: 0,
-            view_number: 0,
-            request_id: next_request_number,
-            result: Some(Op::Set("k".into(), 1)),
-        };
-
-        assert!(client.on_message::<Op>(reply).is_some());
+        let second = begin(&mut client, Op::Set("k".into(), 2));
+        assert_eq!(second.request_number, 2);
+        assert_eq!(second.retry_generation, 1);
+        assert!(
+            client
+                .on_message::<Op>(reply(0, second.request_number, Some(second.op)))
+                .is_some()
+        );
 
         assert_eq!(client.pending_request, None);
         assert_eq!(client.request_number, 2);
         assert_eq!(client.replies_received, 2)
+    }
+
+    #[test]
+    fn retry_lookup_requires_matching_request_and_generation() {
+        let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let pending = begin(&mut client, Op::Set("k".into(), 1));
+
+        assert_eq!(
+            client.pending_retry(pending.request_number, pending.retry_generation),
+            Some(pending.clone())
+        );
+        assert!(
+            client
+                .pending_retry(pending.request_number + 1, pending.retry_generation)
+                .is_none()
+        );
+        assert!(
+            client
+                .pending_retry(pending.request_number, pending.retry_generation + 1)
+                .is_none()
+        );
     }
 }

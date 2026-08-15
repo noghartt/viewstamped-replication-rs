@@ -7,7 +7,7 @@ use vr_replica::effect::Effect;
 use vr_replica::message::{ClientRequest, Message};
 use vr_replica::replica::{Replica, Status};
 
-use crate::client::{Client, Op};
+use crate::client::{Client, Op, PendingRequest};
 use crate::history::{History, RuntimeEvents};
 use crate::invariants::{InvariantViolation, StateChecker};
 use crate::network::{Network, NetworkSendOutcome};
@@ -47,14 +47,20 @@ enum WheelEvent<Input> {
     HeartbeatTick {
         node: NodeId,
     },
+    ClientRetryTick {
+        client_id: NodeId,
+        request_number: usize,
+        generation: u64,
+    },
 }
 
 impl<Input> WheelEvent<Input> {
     fn class(&self) -> EventClass {
         match self {
-            WheelEvent::ClientRequest { .. } => EventClass::ClientRequest,
-            WheelEvent::Deliver { .. } => EventClass::Delivery,
+            Self::ClientRequest { .. } => EventClass::ClientRequest,
+            Self::Deliver { .. } => EventClass::Delivery,
             Self::HeartbeatTick { .. } => EventClass::Timer,
+            Self::ClientRetryTick { .. } => EventClass::Timer,
         }
     }
 }
@@ -65,6 +71,7 @@ pub struct SimulatorConfig {
     pub run_until_max_time: u64,
     pub run_until_max_events: u64,
     pub heartbeat_interval: u64,
+    pub client_retry_interval: u64,
 }
 
 impl Default for SimulatorConfig {
@@ -74,6 +81,7 @@ impl Default for SimulatorConfig {
             run_until_max_time: 60_000,
             run_until_max_events: 50_000,
             heartbeat_interval: 100,
+            client_retry_interval: 1_000,
         }
     }
 }
@@ -284,9 +292,16 @@ impl Simulator<Op> {
                 client_id,
                 request_number,
                 op,
-            } => self.client_request(client_id, request_number, op),
+            } => {
+                self.client_request(client_id, request_number, op);
+            }
             WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message)?,
             WheelEvent::HeartbeatTick { node } => self.heartbeat_tick(node),
+            WheelEvent::ClientRetryTick {
+                client_id,
+                request_number,
+                generation,
+            } => self.client_retry_tick(client_id, request_number, generation),
         }
 
         Ok(())
@@ -297,21 +312,20 @@ impl Simulator<Op> {
     }
 
     pub fn start_client_request(&mut self, client_id: NodeId, op: Op) -> bool {
-        let Some(client) = self.clients.get_mut(&client_id) else {
+        let Some(pending) = self
+            .clients
+            .get_mut(&client_id)
+            .and_then(|client| client.try_begin_request(op))
+        else {
             return false;
         };
 
-        if client.has_pending_request() {
-            return false;
-        }
-
-        let request_number = client.lock_request_number();
         self.schedule_event(
             self.now,
             WheelEvent::ClientRequest {
                 client_id,
-                request_number,
-                op: op.clone(),
+                request_number: pending.request_number,
+                op: pending.op.clone(),
             },
         );
 
@@ -319,10 +333,14 @@ impl Simulator<Op> {
             self.now,
             RuntimeEvents::ClientInvoked {
                 client: client_id,
-                request_number,
-                op,
+                request_number: pending.request_number,
+                op: pending.op.clone(),
             },
         );
+
+        if !self.config.disable_timers {
+            self.schedule_retry(client_id, &pending);
+        }
 
         true
     }
@@ -431,7 +449,7 @@ impl Simulator<Op> {
     }
 
     fn client_request(&mut self, client_id: NodeId, request_number: usize, op: Op) {
-        let Some(client) = self.clients.get_mut(&client_id) else {
+        let Some(client) = self.clients.get(&client_id) else {
             debug!(?client_id, "request for unknown client dropped");
             return;
         };
@@ -442,8 +460,8 @@ impl Simulator<Op> {
             request_number,
             result: None,
         };
-
         let primary = client.believed_primary();
+
         self.send(
             NodeKind::Client(client_id),
             NodeKind::Replica(NodeId(primary)),
@@ -640,6 +658,47 @@ impl Simulator<Op> {
 
         self.schedule_event(at, WheelEvent::HeartbeatTick { node: primary });
     }
+
+    fn client_retry_tick(&mut self, client_id: NodeId, request_number: usize, generation: u64) {
+        let Some(pending) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.pending_retry(request_number, generation))
+        else {
+            return;
+        };
+
+        self.history.insert_history_event(
+            self.now,
+            RuntimeEvents::ClientRetried {
+                client: client_id,
+                request_number,
+                generation,
+            },
+        );
+
+        self.client_request(client_id, request_number, pending.op.clone());
+        self.schedule_retry(client_id, &pending);
+    }
+
+    fn schedule_retry(&mut self, client_id: NodeId, pending: &PendingRequest) {
+        assert!(
+            self.config.client_retry_interval > 0,
+            "client retry interval must be greater than zero"
+        );
+        let at = self
+            .now
+            .checked_add(self.config.client_retry_interval)
+            .expect("virtual time overflow while scheduling client retry");
+        self.schedule_event(
+            at,
+            WheelEvent::ClientRetryTick {
+                client_id,
+                request_number: pending.request_number,
+                generation: pending.retry_generation,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -649,6 +708,8 @@ mod tests {
     use std::rc::Rc;
 
     use vr_replica::state_machine::StateMachine;
+
+    use crate::network::Link;
 
     use super::*;
 
@@ -774,7 +835,7 @@ mod tests {
 
         assert_eq!(s.now, 0);
         assert_eq!(s.events_processed, 0);
-        assert_eq!(s.wheel.len(), 1);
+        assert_eq!(s.wheel.len(), 2);
         assert!(matches!(
             s.history.events(),
             [(
@@ -1172,6 +1233,63 @@ mod tests {
 
         assert_eq!(sim.clients[&NodeId(0)].replies_received, 2);
         assert_eq!(sim.clients[&NodeId(0)].state.get("k"), Some(&2));
+    }
+
+    #[test]
+    fn retry_recovers_first_dropped_request_without_second_invocation() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            client_retry_interval: 5,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.network.set_link(
+            NodeKind::Client(NodeId(0)),
+            NodeKind::Replica(NodeId(0)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        sim.step().unwrap();
+        sim.network.set_link(
+            NodeKind::Client(NodeId(0)),
+            NodeKind::Replica(NodeId(0)),
+            Link::default(),
+        );
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        let invocations = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, RuntimeEvents::ClientInvoked { .. }))
+            .count();
+        let retries = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, RuntimeEvents::ClientRetried { .. }))
+            .count();
+        let completions = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, RuntimeEvents::ClientCompleted { .. }))
+            .count();
+
+        assert_eq!(invocations, 1);
+        assert_eq!(retries, 1);
+        assert_eq!(completions, 1);
+        for replica in sim.replicas.values() {
+            assert_eq!(replica.snapshot().executed_requests.len(), 1);
+        }
     }
 
     #[test]
