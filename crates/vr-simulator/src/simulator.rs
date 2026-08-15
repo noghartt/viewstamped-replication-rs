@@ -1293,6 +1293,244 @@ mod tests {
     }
 
     #[test]
+    fn retry_recovers_first_dropped_reply_from_cached_result() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            client_retry_interval: 5,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Client(NodeId(0)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        while !sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::NetworkRequest {
+                    from: NodeKind::Replica(NodeId(0)),
+                    to: NodeKind::Client(NodeId(0)),
+                    outcome: NetworkSendOutcome::Dropped,
+                    message: Message::Reply { .. },
+                }
+            )
+        }) {
+            sim.step().unwrap();
+        }
+
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Client(NodeId(0)),
+            Link::default(),
+        );
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        let replies_sent = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    RuntimeEvents::NetworkRequest {
+                        from: NodeKind::Replica(NodeId(0)),
+                        to: NodeKind::Client(NodeId(0)),
+                        message: Message::Reply { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        let completions = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, RuntimeEvents::ClientCompleted { .. }))
+            .count();
+
+        assert_eq!(replies_sent, 2);
+        assert_eq!(completions, 1);
+        for replica in sim.replicas.values() {
+            let snapshot = replica.snapshot();
+            assert_eq!(snapshot.log.len(), 1);
+            assert_eq!(snapshot.executed_requests.len(), 1);
+        }
+    }
+
+    #[test]
+    fn stale_retry_tick_after_completion_is_silent_and_does_not_reschedule() {
+        let config = SimulatorConfig {
+            client_retry_interval: 5,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        while sim.clients[&NodeId(0)].has_pending_request() {
+            sim.step().unwrap();
+        }
+
+        let history_len = sim.history.events().len();
+        let wheel_len = sim.wheel.len();
+        assert!(sim.wheel.values().any(|event| {
+            matches!(
+                event,
+                WheelEvent::ClientRetryTick {
+                    client_id: NodeId(0),
+                    request_number: 1,
+                    generation: 0,
+                }
+            )
+        }));
+
+        sim.step().unwrap();
+
+        assert_eq!(sim.now, 5);
+        assert_eq!(sim.history.events().len(), history_len);
+        assert_eq!(sim.wheel.len(), wheel_len - 1);
+        assert!(
+            !sim.history
+                .events()
+                .iter()
+                .any(|(_, event)| { matches!(event, RuntimeEvents::ClientRetried { .. }) })
+        );
+    }
+
+    #[test]
+    fn duplicated_retry_request_and_reply_still_execute_once() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            client_retry_interval: 5,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.network.set_link(
+            NodeKind::Client(NodeId(0)),
+            NodeKind::Replica(NodeId(0)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        sim.step().unwrap();
+        sim.network.set_link(
+            NodeKind::Client(NodeId(0)),
+            NodeKind::Replica(NodeId(0)),
+            Link {
+                duplication_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Client(NodeId(0)),
+            Link {
+                duplication_probability: 100,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        let request_deliveries = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    RuntimeEvents::NetworkDelivered {
+                        from: NodeKind::Client(NodeId(0)),
+                        to: NodeKind::Replica(NodeId(0)),
+                        message: Message::Request(_),
+                    }
+                )
+            })
+            .count();
+        let reply_deliveries = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    RuntimeEvents::NetworkDelivered {
+                        from: NodeKind::Replica(NodeId(0)),
+                        to: NodeKind::Client(NodeId(0)),
+                        message: Message::Reply { .. },
+                    }
+                )
+            })
+            .count();
+
+        assert_eq!(request_deliveries, 2);
+        assert_eq!(reply_deliveries, 2);
+        assert_eq!(sim.clients[&NodeId(0)].replies_received, 1);
+        for replica in sim.replicas.values() {
+            let snapshot = replica.snapshot();
+            assert_eq!(snapshot.log.len(), 1);
+            assert_eq!(snapshot.executed_requests.len(), 1);
+        }
+    }
+
+    #[test]
+    fn same_seed_same_retry_history() {
+        let run = |seed| {
+            let config = SimulatorConfig {
+                heartbeat_interval: 10,
+                client_retry_interval: 5,
+                run_until_max_time: 11,
+                ..Default::default()
+            };
+            let mut sim = setup(seed, 3, Some(config));
+            sim.create_network_perfect_mesh();
+            sim.network.set_link(
+                NodeKind::Client(NodeId(0)),
+                NodeKind::Replica(NodeId(0)),
+                Link {
+                    drop_probability: 100,
+                    ..Default::default()
+                },
+            );
+            sim.start_timers();
+            assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+            sim.step().unwrap();
+            sim.network.set_link(
+                NodeKind::Client(NodeId(0)),
+                NodeKind::Replica(NodeId(0)),
+                Link::default(),
+            );
+            sim.run().unwrap();
+
+            assert!(
+                sim.history
+                    .events()
+                    .iter()
+                    .any(|(_, event)| { matches!(event, RuntimeEvents::ClientRetried { .. }) })
+            );
+            format!("{:?}", sim.history)
+        };
+
+        assert_eq!(run(42), run(42));
+    }
+
+    #[test]
     fn heartbeat_sends_commit_to_every_backup() {
         let config = SimulatorConfig {
             heartbeat_interval: 10,
