@@ -1,4 +1,4 @@
-use crate::types::{OpNumber, ReplicaId};
+use crate::types::{LogEntry, OpNumber, ReplicaId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientRequest<I, O> {
@@ -40,5 +40,17 @@ pub enum Message<I, O> {
     Commit {
         view_number: ReplicaId,
         commit_number: OpNumber,
+    },
+    GetState {
+        view_number: ReplicaId,
+        replica_number: ReplicaId,
+        last_op_number: OpNumber,
+    },
+    NewState {
+        view_number: ReplicaId,
+        replica_number: ReplicaId,
+        op_number: OpNumber,
+        commit_number: OpNumber,
+        entries: Vec<LogEntry<I, O>>,
     },
 }

@@ -133,6 +133,22 @@ fn message_label<I: fmt::Debug, O: fmt::Debug>(message: &Message<I, O>) -> Strin
             view_number,
             commit_number,
         } => format!("Commit(op={commit_number}, view_number={view_number})"),
+        Message::GetState {
+            view_number,
+            replica_number,
+            last_op_number,
+        } => format!(
+            "GetState(view_number={view_number}, replica_number={replica_number}, last_op_number={last_op_number})"
+        ),
+        Message::NewState {
+            view_number,
+            replica_number,
+            op_number,
+            commit_number,
+            ..
+        } => format!(
+            "NewState(view_number={view_number}, replica_number={replica_number}, op_number={op_number}, commit_number={commit_number})"
+        ),
     }
 }
 

@@ -312,7 +312,7 @@ impl Simulator<Op> {
                 self.client_request(client_id, request_number, op);
             }
             WheelEvent::Deliver { from, to, message } => self.deliver(from, to, message)?,
-            WheelEvent::HeartbeatTick { node } => self.heartbeat_tick(node),
+            WheelEvent::HeartbeatTick { node } => self.heartbeat_tick(node)?,
             WheelEvent::ClientRetryTick {
                 client_id,
                 request_number,
@@ -630,24 +630,24 @@ impl Simulator<Op> {
         debug_assert!(replaced.is_none())
     }
 
-    fn heartbeat_tick(&mut self, node: NodeId) {
+    fn heartbeat_tick(&mut self, node: NodeId) -> Result<(), InvariantViolation> {
         if self.config.disable_timers {
-            return;
+            return Ok(());
         }
 
         let Some(replica) = self.replicas.get(&node) else {
             debug!(?node, "heartbeat for unknown replica ignored");
-            return;
+            return Ok(());
         };
 
         let snapshot = replica.snapshot();
         if snapshot.status != Status::Normal {
-            return;
+            return Ok(());
         }
 
         let replicas: Vec<NodeId> = self.replicas.keys().copied().collect();
         if replicas.is_empty() {
-            return;
+            return Ok(());
         }
 
         let primary_index = (snapshot.view_number % replicas.len() as u64) as usize;
@@ -655,27 +655,19 @@ impl Simulator<Op> {
 
         // This may be an old timer belonging to a former primary.
         if node != primary {
-            return;
+            return Ok(());
         }
 
-        let commit = Message::Commit {
-            view_number: snapshot.view_number,
-            commit_number: snapshot.commit_number,
-        };
-
-        for backup in replicas.into_iter().filter(|replica| *replica != node) {
-            self.send(
-                NodeKind::Replica(node),
-                NodeKind::Replica(backup),
-                commit.clone(),
-            );
-        }
+        let effects = replica.heartbeat_effects();
+        self.apply_effects(NodeKind::Replica(node), effects)?;
 
         let next_at = self
             .now
             .checked_add(self.config.heartbeat_interval)
             .expect("virtual time overflow while scheduling heartbeat");
         self.schedule_event(next_at, WheelEvent::HeartbeatTick { node });
+
+        Ok(())
     }
 
     pub fn start_timers(&mut self) {
@@ -1395,6 +1387,137 @@ mod tests {
         for replica in sim.replicas.values() {
             assert_eq!(replica.snapshot().executed_requests.len(), 1);
         }
+    }
+
+    #[test]
+    fn heartbeat_retransmission_recovers_quorum_critical_dropped_prepare() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 5,
+            client_retry_interval: 50,
+            watchdog_interval: 50,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.fault_free_network = false;
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Replica(NodeId(1)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Replica(NodeId(2)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(2)),
+            NodeKind::Replica(NodeId(0)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        sim.step().unwrap();
+        sim.step().unwrap();
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Replica(NodeId(1)),
+            Link::default(),
+        );
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        assert_eq!(sim.clients[&NodeId(0)].replies_received, 1);
+        assert_eq!(sim.replicas[&NodeId(0)].snapshot().commit_number, 1);
+        assert_eq!(sim.replicas[&NodeId(1)].snapshot().commit_number, 1);
+        assert_eq!(sim.replicas[&NodeId(2)].snapshot().commit_number, 0);
+        assert!(sim.history.events().iter().any(|(at, event)| {
+            *at == 5
+                && matches!(
+                    event,
+                    RuntimeEvents::NetworkRequest {
+                        from: NodeKind::Replica(NodeId(0)),
+                        to: NodeKind::Replica(NodeId(1)),
+                        message: Message::Prepare { op_number: 1, .. },
+                        ..
+                    }
+                )
+        }));
+    }
+
+    #[test]
+    fn later_prepare_triggers_state_transfer_and_backup_converges() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            client_retry_interval: 50,
+            watchdog_interval: 50,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.fault_free_network = false;
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Replica(NodeId(1)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("a".into(), 1)));
+
+        while sim.clients[&NodeId(0)].has_pending_request() {
+            sim.step().unwrap();
+        }
+
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Replica(NodeId(1)),
+            Link::default(),
+        );
+        assert!(sim.start_client_request(NodeId(0), Op::Set("b".into(), 2)));
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        assert_eq!(sim.clients[&NodeId(0)].replies_received, 2);
+        for replica in sim.replicas.values() {
+            let snapshot = replica.snapshot();
+            assert_eq!(snapshot.op_number, 2);
+            assert_eq!(snapshot.commit_number, 2);
+            assert_eq!(snapshot.log.len(), 2);
+            assert_eq!(snapshot.executed_requests.len(), 2);
+        }
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::NetworkDelivered {
+                    message: Message::GetState { .. },
+                    ..
+                }
+            )
+        }));
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::NetworkDelivered {
+                    message: Message::NewState { .. },
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]

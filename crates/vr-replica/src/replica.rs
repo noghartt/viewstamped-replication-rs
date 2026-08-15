@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -12,7 +13,7 @@ use crate::snapshot::{
 };
 use crate::state_machine::StateMachine;
 use crate::transition::{MessageSender, ProtocolObservation, Transition};
-use crate::types::{OpNumber, ReplicaId};
+use crate::types::{LogEntry, OpNumber, ReplicaId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -37,7 +38,7 @@ where
 
     op_number: usize,
     commit_number: usize,
-    log: Vec<(OpNumber, ClientRequest<Input, Output>)>,
+    log: Vec<LogEntry<Input, Output>>,
 
     // TODO: Based on the paper, I do need to implement a field that tracks if the given
     // request has already been executed by the replica. If yes, I should store the result
@@ -134,6 +135,45 @@ where
 
                 self.transition_with_primary_activity(effects, accepted, primary)
             }
+            Message::GetState {
+                view_number,
+                replica_number,
+                last_op_number,
+            } => {
+                if sender != MessageSender::Replica(replica_number) {
+                    return Transition::from_effects(Vec::new());
+                }
+
+                Transition::from_effects(self.on_get_state(
+                    view_number,
+                    replica_number,
+                    last_op_number,
+                ))
+            }
+            Message::NewState {
+                view_number,
+                replica_number,
+                op_number,
+                commit_number,
+                entries,
+            } => {
+                let primary = self.primary_for_view(view_number);
+
+                if sender != MessageSender::Replica(primary) {
+                    return Transition::from_effects(Vec::new());
+                }
+
+                let accepted = self.accepts_primary_activity(sender, view_number);
+                let effects = self.on_new_state(
+                    view_number,
+                    replica_number,
+                    op_number,
+                    commit_number,
+                    entries,
+                );
+
+                self.transition_with_primary_activity(effects, accepted, primary)
+            }
             m => {
                 debug!(
                     ?m,
@@ -154,6 +194,10 @@ where
                 MessageSender::Replica(self.primary_for_view(*view_number))
             }
             Message::PrepareOk { replica_number, .. } => MessageSender::Replica(*replica_number),
+            Message::GetState { replica_number, .. } => MessageSender::Replica(*replica_number),
+            Message::NewState { view_number, .. } => {
+                MessageSender::Replica(self.primary_for_view(*view_number))
+            }
             _ => MessageSender::Replica(self.view_number),
         };
 
@@ -217,7 +261,11 @@ where
         debug_assert_eq!(self.log.len(), self.op_number);
 
         self.op_number += 1;
-        self.log.push((self.op_number, request.clone()));
+        self.log.push(LogEntry {
+            op_number: self.op_number,
+            request: request.clone(),
+        });
+
         self.client_table.insert(request.client_id, request.clone());
         self.ack_request(self.replica_number, self.op_number);
 
@@ -261,59 +309,88 @@ where
             return Vec::new();
         }
 
-        let mut effects = vec![];
-
-        if self.log.len() + 1 == op_number {
-            debug_assert_eq!(self.op_number, self.log.len());
-
-            self.log.push((op_number, *request.clone()));
-            effects.push(Effect::Prepared {
-                replica: self.replica_number,
-                op: op_number,
-            });
-
-            self.op_number = op_number;
-            self.client_table.insert(request.client_id, *request);
-
-            let target = commit_number.min(self.log.len());
-            let committed = self.commit_up_to(target);
-
-            committed.iter().for_each(|(op_number, _, _)| {
-                effects.push(Effect::Committed {
-                    replica: self.replica_number,
-                    op: *op_number,
-                })
-            });
-
-            let prepare_ok = Message::PrepareOk {
-                view_number: self.view_number,
-                replica_number: self.replica_number,
-                op_number,
-            };
-
-            effects.push(Effect::Send {
-                to: self.primary_for_view(self.view_number),
-                message: prepare_ok,
-            });
-        } else if op_number <= self.log.len() {
-            let (_, stored) = &self.log[op_number - 1];
-            let matches = stored.client_id == request.client_id
-                && stored.request_number == request.request_number
-                && stored.op == request.op;
-
-            if matches {
-                effects.push(Effect::Send {
-                    to: self.primary_for_view(self.view_number),
-                    message: Message::PrepareOk {
-                        view_number: self.view_number,
-                        replica_number: self.replica_number,
-                        op_number,
-                    },
-                });
-            }
+        if op_number == 0 {
+            return Vec::new();
         }
 
-        effects
+        let expected_op_number = self.op_number + 1;
+        match op_number.cmp(&expected_op_number) {
+            Ordering::Equal => {
+                debug_assert_eq!(self.op_number, self.log.len());
+
+                let mut effects = vec![];
+
+                self.log.push(LogEntry {
+                    op_number,
+                    request: *request.clone(),
+                });
+
+                effects.push(Effect::Prepared {
+                    replica: self.replica_number,
+                    op: op_number,
+                });
+
+                self.op_number = op_number;
+                self.client_table.insert(request.client_id, *request);
+
+                let target = commit_number.min(self.log.len());
+                let committed = self.commit_up_to(target);
+
+                committed.iter().for_each(|(op_number, _, _)| {
+                    effects.push(Effect::Committed {
+                        replica: self.replica_number,
+                        op: *op_number,
+                    })
+                });
+
+                let prepare_ok = Message::PrepareOk {
+                    view_number: self.view_number,
+                    replica_number: self.replica_number,
+                    op_number,
+                };
+
+                effects.push(Effect::Send {
+                    to: self.primary_for_view(self.view_number),
+                    message: prepare_ok,
+                });
+
+                effects
+            }
+            Ordering::Less => {
+                let mut effects = Vec::new();
+
+                let log = &self.log[op_number - 1];
+                let matches = log.request.client_id == request.client_id
+                    && log.request.request_number == request.request_number
+                    && log.request.op == request.op;
+
+                if matches {
+                    effects.push(Effect::Send {
+                        to: self.primary_for_view(self.view_number),
+                        message: Message::PrepareOk {
+                            view_number: self.view_number,
+                            replica_number: self.replica_number,
+                            op_number,
+                        },
+                    });
+                }
+
+                effects
+            }
+            Ordering::Greater => {
+                let target = commit_number.min(self.log.len());
+                let mut effects = self
+                    .commit_up_to(target)
+                    .into_iter()
+                    .map(|(op_number, _, _)| Effect::Committed {
+                        replica: self.replica_number,
+                        op: op_number,
+                    })
+                    .collect::<Vec<_>>();
+                effects.extend(self.request_state_transfer());
+                effects
+            }
+        }
     }
 
     fn on_prepare_ok(
@@ -368,14 +445,194 @@ where
         }
 
         let target = commit_number.min(self.log.len());
-
-        self.commit_up_to(target)
+        let mut effects = self
+            .commit_up_to(target)
             .into_iter()
             .map(|(op_number, _, _)| Effect::Committed {
                 replica: self.replica_number,
                 op: op_number,
             })
+            .collect::<Vec<_>>();
+
+        if commit_number > self.op_number {
+            effects.extend(self.request_state_transfer());
+        }
+
+        effects
+    }
+
+    pub fn heartbeat_effects(&self) -> Vec<Effect<Input, Output>> {
+        if self.status != Status::Normal || !self.is_primary() {
+            return Vec::new();
+        }
+
+        self.configuration
+            .iter()
+            .copied()
+            .filter(|replica| *replica != self.replica_number)
+            .map(|replica| {
+                let acknowledged = self.op_ack_table.get(&replica).copied().unwrap_or(0);
+
+                if acknowledged < self.op_number {
+                    let entry = &self.log[acknowledged];
+                    Effect::Send {
+                        to: replica,
+                        message: Message::Prepare {
+                            op: entry.request.op.clone(),
+                            view_number: self.view_number,
+                            op_number: entry.op_number,
+                            commit_number: self.commit_number,
+                            request: Box::new(entry.request.clone()),
+                        },
+                    }
+                } else {
+                    Effect::Send {
+                        to: replica,
+                        message: Message::Commit {
+                            view_number: self.view_number,
+                            commit_number: self.commit_number,
+                        },
+                    }
+                }
+            })
             .collect()
+    }
+
+    fn on_get_state(
+        &self,
+        view_number: ReplicaId,
+        replica_number: ReplicaId,
+        last_op_number: OpNumber,
+    ) -> Vec<Effect<Input, Output>> {
+        if self.status != Status::Normal
+            || !self.is_primary()
+            || !self.is_same_view(view_number)
+            || replica_number == self.replica_number
+            || !self.configuration.contains(&replica_number)
+            || last_op_number > self.op_number
+        {
+            return Vec::new();
+        }
+
+        let entries = self.log.iter().skip(last_op_number).cloned().collect();
+
+        vec![Effect::Send {
+            to: replica_number,
+            message: Message::NewState {
+                view_number: self.view_number,
+                replica_number,
+                op_number: self.op_number,
+                commit_number: self.commit_number,
+                entries,
+            },
+        }]
+    }
+
+    fn on_new_state(
+        &mut self,
+        view_number: ReplicaId,
+        replica_number: ReplicaId,
+        op_number: OpNumber,
+        commit_number: OpNumber,
+        entries: Vec<LogEntry<Input, Output>>,
+    ) -> Vec<Effect<Input, Output>> {
+        if self.status != Status::Normal
+            || self.is_primary()
+            || !self.is_same_view(view_number)
+            || replica_number != self.replica_number
+            || commit_number > op_number
+        {
+            return Vec::new();
+        }
+
+        if entries
+            .windows(2)
+            .any(|pair| pair[1].op_number != pair[0].op_number + 1)
+        {
+            return Vec::new();
+        }
+
+        if entries
+            .iter()
+            .any(|entry| entry.op_number == 0 || entry.request.result.is_some())
+        {
+            return Vec::new();
+        }
+
+        match entries.last() {
+            Some(last) if last.op_number != op_number => return Vec::new(),
+            None if op_number > self.op_number => return Vec::new(),
+            _ => {}
+        }
+
+        let old_log_len = self.log.len();
+        let mut candidate = self.log.clone();
+
+        for transferred in &entries {
+            let index = transferred.op_number - 1;
+
+            match candidate.get(index) {
+                Some(existing) if Self::same_log_entry(existing, transferred) => {}
+                Some(_) => return Vec::new(),
+                None if index == candidate.len() => {
+                    candidate.push(transferred.clone());
+                }
+                None => return Vec::new(),
+            }
+        }
+
+        if op_number > candidate.len() {
+            return Vec::new();
+        }
+
+        let appended = candidate[old_log_len..].to_vec();
+
+        self.log = candidate;
+        self.op_number = self.log.len();
+
+        let mut effects = Vec::new();
+
+        for entry in appended {
+            let request = entry.request;
+
+            effects.push(Effect::Prepared {
+                replica: self.replica_number,
+                op: entry.op_number,
+            });
+
+            let should_update = self
+                .client_table
+                .get(&request.client_id)
+                .is_none_or(|latest| latest.request_number <= request.request_number);
+
+            if should_update {
+                self.client_table.insert(request.client_id, request);
+            }
+        }
+
+        let target = commit_number.min(self.log.len());
+
+        for (op_number, _, _) in self.commit_up_to(target) {
+            effects.push(Effect::Committed {
+                replica: self.replica_number,
+                op: op_number,
+            });
+        }
+
+        if self.op_number > 0 {
+            // PrepareOk is a cumulative watermark, so re-acknowledging after a
+            // duplicate transfer is safe and repairs a dropped prior ack.
+            effects.push(Effect::Send {
+                to: self.primary_for_view(self.view_number),
+                message: Message::PrepareOk {
+                    view_number: self.view_number,
+                    replica_number: self.replica_number,
+                    op_number: self.op_number,
+                },
+            });
+        }
+
+        effects
     }
 
     #[inline]
@@ -400,16 +657,15 @@ where
         self.configuration.len() / 2 + 1
     }
 
-    // TODO: Validate if it needs to do more operations here
     fn commit_op(&mut self, op_number: OpNumber) -> (usize, Output, ClientRequest<Input, Output>) {
         debug_assert_eq!(op_number, self.commit_number + 1);
 
-        let (_, request) = self.log.get(op_number - 1).unwrap();
+        let log_entry = self.log.get(op_number - 1).unwrap();
 
         let sm = self.state_machine.clone();
 
-        let result = sm.borrow_mut().apply(request.op.clone());
-        let mut request = request.clone();
+        let result = sm.borrow_mut().apply(log_entry.request.op.clone());
+        let mut request = log_entry.request.clone();
 
         self.executed_requests.push(ExecutedRequestSnapshot {
             client_id: request.client_id,
@@ -471,11 +727,11 @@ where
             log: self
                 .log
                 .iter()
-                .map(|(op_number, request)| LogEntrySnapshot {
-                    op_number: *op_number,
-                    client_id: request.client_id,
-                    request_number: request.request_number,
-                    op: request.op.clone(),
+                .map(|log_entry| LogEntrySnapshot {
+                    op_number: log_entry.op_number,
+                    client_id: log_entry.request.client_id,
+                    request_number: log_entry.request.request_number,
+                    op: log_entry.request.op.clone(),
                 })
                 .collect(),
             client_table: self
@@ -490,6 +746,24 @@ where
                 .collect(),
             executed_requests: self.executed_requests.clone(),
         }
+    }
+
+    fn request_state_transfer(&self) -> Vec<Effect<Input, Output>> {
+        vec![Effect::Send {
+            to: self.primary_for_view(self.view_number),
+            message: Message::GetState {
+                view_number: self.view_number,
+                replica_number: self.replica_number,
+                last_op_number: self.op_number,
+            },
+        }]
+    }
+
+    fn same_log_entry(left: &LogEntry<Input, Output>, right: &LogEntry<Input, Output>) -> bool {
+        left.op_number == right.op_number
+            && left.request.client_id == right.request.client_id
+            && left.request.request_number == right.request.request_number
+            && left.request.op == right.request.op
     }
 }
 #[cfg(test)]
@@ -548,6 +822,38 @@ mod tests {
 
         assert_eq!(replica.primary_for_view(3), 0);
         assert!(replica.is_primary());
+    }
+
+    #[test]
+    fn heartbeat_retransmits_first_unacknowledged_prepare_per_backup() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm);
+        primary.on_message(request(10, 1, "a"));
+        primary.on_message(prepare_ok(1, 1));
+
+        let effects = primary.heartbeat_effects();
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Send {
+                    to: 1,
+                    message: Message::Commit {
+                        commit_number: 1,
+                        ..
+                    },
+                }
+            )
+        }));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Send {
+                    to: 2,
+                    message: Message::Prepare { op_number: 1, .. },
+                }
+            )
+        }));
     }
 
     #[test]
@@ -1111,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_with_log_gap_is_ignored() {
+    fn prepare_with_log_gap_requests_state_transfer_without_mutation() {
         let sm = Rc::new(RefCell::new(RecordingSm::default()));
         let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
         let before = backup.snapshot();
@@ -1128,10 +1434,42 @@ mod tests {
             },
         ));
 
-        assert!(effects.is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: 0,
+                message: Message::GetState {
+                    view_number: 0,
+                    replica_number: 1,
+                    last_op_number: 0,
+                },
+            }]
+        );
         assert_eq!(backup.snapshot(), before);
         assert!(backup.client_table.is_empty());
         assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn prepare_with_zero_operation_number_is_ignored() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
+        let before = backup.snapshot();
+
+        let transition = backup.on_message(prepare(
+            String::from("a"),
+            0,
+            0,
+            ClientRequest {
+                client_id: 10,
+                op: String::from("a"),
+                request_number: 1,
+                result: None,
+            },
+        ));
+
+        assert!(transition.effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
     }
 
     #[test]
@@ -1268,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_beyond_log_is_clamped() {
+    fn commit_beyond_log_commits_available_prefix_and_requests_state_transfer() {
         let sm = Rc::new(RefCell::new(RecordingSm::default()));
         let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
         let req = ClientRequest {
@@ -1283,7 +1621,20 @@ mod tests {
 
         assert_eq!(backup.snapshot().commit_number, 1);
         assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
-        assert_eq!(effects, vec![Effect::Committed { replica: 1, op: 1 }]);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Committed { replica: 1, op: 1 },
+                Effect::Send {
+                    to: 0,
+                    message: Message::GetState {
+                        view_number: 0,
+                        replica_number: 1,
+                        last_op_number: 1,
+                    },
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1506,6 +1857,274 @@ mod tests {
     }
 
     #[test]
+    fn get_state_returns_suffix_after_backup_watermark() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm);
+        primary.on_message(request(10, 1, "a"));
+        primary.on_message(request(20, 1, "b"));
+
+        let transition = primary.on_message(Message::GetState {
+            view_number: 0,
+            replica_number: 1,
+            last_op_number: 1,
+        });
+
+        assert_eq!(transition.effects.len(), 1);
+        let Effect::Send {
+            to,
+            message:
+                Message::NewState {
+                    op_number,
+                    commit_number,
+                    entries,
+                    ..
+                },
+        } = &transition.effects[0]
+        else {
+            panic!("expected NewState response");
+        };
+        assert_eq!(*to, 1);
+        assert_eq!(*op_number, 2);
+        assert_eq!(*commit_number, 0);
+        assert_eq!(entries, &vec![log_entry(2, 20, 1, "b")]);
+    }
+
+    #[test]
+    fn new_state_installs_suffix_commits_in_order_and_updates_client_table() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+
+        let transition = backup.on_message(Message::NewState {
+            view_number: 0,
+            replica_number: 1,
+            op_number: 2,
+            commit_number: 1,
+            entries: vec![log_entry(1, 10, 1, "a"), log_entry(2, 20, 1, "b")],
+        });
+        let snapshot = backup.snapshot();
+
+        assert_eq!(snapshot.op_number, 2);
+        assert_eq!(snapshot.commit_number, 1);
+        assert_eq!(snapshot.log.len(), 2);
+        assert_eq!(snapshot.client_table.len(), 2);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
+        assert!(matches!(
+            transition.effects.last(),
+            Some(Effect::Send {
+                to: 0,
+                message: Message::PrepareOk { op_number: 2, .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_new_state_is_idempotent_and_reacknowledged() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let response = Message::NewState {
+            view_number: 0,
+            replica_number: 1,
+            op_number: 2,
+            commit_number: 2,
+            entries: vec![log_entry(1, 10, 1, "a"), log_entry(2, 20, 1, "b")],
+        };
+
+        backup.on_message(response.clone());
+        let before = backup.snapshot();
+        let duplicate = backup.on_message(response);
+
+        assert_eq!(backup.snapshot(), before);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(duplicate.effects.len(), 1);
+        assert!(matches!(
+            duplicate.effects[0],
+            Effect::Send {
+                message: Message::PrepareOk { op_number: 2, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn conflicting_new_state_is_rejected_atomically() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        backup.on_message(prepare(
+            String::from("a"),
+            1,
+            0,
+            ClientRequest {
+                client_id: 10,
+                op: String::from("a"),
+                request_number: 1,
+                result: None,
+            },
+        ));
+        let before = backup.snapshot();
+
+        let transition = backup.on_message(Message::NewState {
+            view_number: 0,
+            replica_number: 1,
+            op_number: 2,
+            commit_number: 1,
+            entries: vec![log_entry(1, 10, 1, "conflict"), log_entry(2, 20, 1, "b")],
+        });
+
+        assert!(transition.effects.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn new_state_wrong_sender_and_target_are_rejected() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
+        let response = Message::NewState {
+            view_number: 0,
+            replica_number: 1,
+            op_number: 1,
+            commit_number: 0,
+            entries: vec![log_entry(1, 10, 1, "a")],
+        };
+
+        let wrong_sender = backup.on_message_from(MessageSender::Replica(2), response.clone());
+        let wrong_target = backup.on_message(Message::NewState {
+            view_number: 0,
+            replica_number: 2,
+            op_number: 1,
+            commit_number: 0,
+            entries: vec![log_entry(1, 10, 1, "a")],
+        });
+
+        assert!(wrong_sender.effects.is_empty());
+        assert!(wrong_sender.observations.is_empty());
+        assert!(wrong_target.effects.is_empty());
+        assert!(backup.snapshot().log.is_empty());
+    }
+
+    #[test]
+    fn malformed_new_state_responses_are_rejected_atomically() {
+        let malformed = vec![
+            Message::NewState {
+                view_number: 0,
+                replica_number: 1,
+                op_number: 3,
+                commit_number: 0,
+                entries: vec![log_entry(1, 10, 1, "a"), log_entry(3, 30, 1, "c")],
+            },
+            Message::NewState {
+                view_number: 0,
+                replica_number: 1,
+                op_number: 1,
+                commit_number: 2,
+                entries: vec![log_entry(1, 10, 1, "a")],
+            },
+            Message::NewState {
+                view_number: 0,
+                replica_number: 1,
+                op_number: 2,
+                commit_number: 0,
+                entries: Vec::new(),
+            },
+            Message::NewState {
+                view_number: 0,
+                replica_number: 1,
+                op_number: 2,
+                commit_number: 0,
+                entries: vec![log_entry(1, 10, 1, "a")],
+            },
+            Message::NewState {
+                view_number: 0,
+                replica_number: 1,
+                op_number: 1,
+                commit_number: 0,
+                entries: vec![LogEntry {
+                    op_number: 1,
+                    request: ClientRequest {
+                        op: String::from("a"),
+                        client_id: 10,
+                        request_number: 1,
+                        result: Some(String::from("unexpected")),
+                    },
+                }],
+            },
+        ];
+
+        for message in malformed {
+            let sm = Rc::new(RefCell::new(RecordingSm::default()));
+            let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+            let before = backup.snapshot();
+
+            let transition = backup.on_message(message);
+
+            assert!(transition.effects.is_empty());
+            assert_eq!(backup.snapshot(), before);
+            assert!(sm.borrow().applied.is_empty());
+        }
+    }
+
+    #[test]
+    fn stale_new_state_cannot_regress_installed_state() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        backup.on_message(Message::NewState {
+            view_number: 0,
+            replica_number: 1,
+            op_number: 2,
+            commit_number: 2,
+            entries: vec![log_entry(1, 10, 1, "a"), log_entry(2, 20, 1, "b")],
+        });
+        let before = backup.snapshot();
+
+        let stale = backup.on_message(Message::NewState {
+            view_number: 0,
+            replica_number: 1,
+            op_number: 1,
+            commit_number: 1,
+            entries: vec![log_entry(1, 10, 1, "a")],
+        });
+
+        assert_eq!(backup.snapshot(), before);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stale.effects.len(), 1);
+        assert!(matches!(
+            stale.effects[0],
+            Effect::Send {
+                message: Message::PrepareOk { op_number: 2, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn get_state_rejects_wrong_sender_non_member_and_ahead_watermark() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm);
+        primary.on_message(request(10, 1, "a"));
+        let request = Message::GetState {
+            view_number: 0,
+            replica_number: 1,
+            last_op_number: 0,
+        };
+
+        let wrong_sender = primary.on_message_from(MessageSender::Replica(2), request.clone());
+        let non_member = primary.on_message(Message::GetState {
+            view_number: 0,
+            replica_number: 99,
+            last_op_number: 0,
+        });
+        let ahead = primary.on_message(Message::GetState {
+            view_number: 0,
+            replica_number: 1,
+            last_op_number: 2,
+        });
+
+        assert!(wrong_sender.effects.is_empty());
+        assert!(non_member.effects.is_empty());
+        assert!(ahead.effects.is_empty());
+    }
+
+    #[test]
     fn wrong_sender_is_rejected_but_prepare_gap_still_observes_primary_activity() {
         let sm = Rc::new(RefCell::new(RecordingSm::default()));
         let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
@@ -1529,7 +2148,14 @@ mod tests {
         assert!(wrong_sender.effects.is_empty());
         assert!(wrong_sender.observations.is_empty());
         assert_eq!(backup.snapshot(), before);
-        assert!(gap.effects.is_empty());
+        assert_eq!(gap.effects.len(), 1);
+        assert!(matches!(
+            gap.effects[0],
+            Effect::Send {
+                message: Message::GetState { .. },
+                ..
+            }
+        ));
         assert_eq!(gap.observations.len(), 1);
     }
 
@@ -1572,6 +2198,23 @@ mod tests {
             request_number,
             result: None,
         })
+    }
+
+    fn log_entry(
+        op_number: usize,
+        client_id: u64,
+        request_number: usize,
+        op: &str,
+    ) -> LogEntry<String, String> {
+        LogEntry {
+            op_number,
+            request: ClientRequest {
+                op: op.to_string(),
+                client_id,
+                request_number,
+                result: None,
+            },
+        }
     }
 
     fn prepare<I, O>(
