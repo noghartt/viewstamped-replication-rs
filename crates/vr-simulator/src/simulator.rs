@@ -6,6 +6,7 @@ use tracing::{debug, info, trace};
 use vr_replica::effect::Effect;
 use vr_replica::message::{ClientRequest, Message};
 use vr_replica::replica::{Replica, Status};
+use vr_replica::transition::{MessageSender, ProtocolObservation, Transition};
 
 use crate::client::{Client, Op, PendingRequest};
 use crate::history::{History, RuntimeEvents};
@@ -52,6 +53,10 @@ enum WheelEvent<Input> {
         request_number: usize,
         generation: u64,
     },
+    WatchdogTick {
+        node: NodeId,
+        generation: u64,
+    },
 }
 
 impl<Input> WheelEvent<Input> {
@@ -61,6 +66,7 @@ impl<Input> WheelEvent<Input> {
             Self::Deliver { .. } => EventClass::Delivery,
             Self::HeartbeatTick { .. } => EventClass::Timer,
             Self::ClientRetryTick { .. } => EventClass::Timer,
+            Self::WatchdogTick { .. } => EventClass::Timer,
         }
     }
 }
@@ -72,6 +78,7 @@ pub struct SimulatorConfig {
     pub run_until_max_events: u64,
     pub heartbeat_interval: u64,
     pub client_retry_interval: u64,
+    pub watchdog_interval: u64,
 }
 
 impl Default for SimulatorConfig {
@@ -82,6 +89,7 @@ impl Default for SimulatorConfig {
             run_until_max_events: 50_000,
             heartbeat_interval: 100,
             client_retry_interval: 1_000,
+            watchdog_interval: 500,
         }
     }
 }
@@ -92,6 +100,12 @@ impl Default for SimulatorConfig {
 /// - EventClass
 /// - Monotonic ID
 type EventKey = (u64, EventClass, u64);
+
+#[derive(Debug, Clone, Copy)]
+struct ReplicaMonitor {
+    generation: u64,
+    expired: bool,
+}
 
 #[derive(Debug)]
 pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
@@ -106,6 +120,7 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
 
     replicas: Replicas<Input, Op>,
     clients: Clients,
+    monitors: BTreeMap<NodeId, ReplicaMonitor>,
 
     wheel: BTreeMap<EventKey, WheelEvent<Input>>,
     next_event_sequence: u64,
@@ -126,6 +141,7 @@ impl Simulator<Op> {
             history: History::new(),
             replicas: BTreeMap::new(),
             clients: BTreeMap::new(),
+            monitors: BTreeMap::new(),
             config: config.unwrap_or_default(),
             checker: StateChecker::new(),
             fault_free_network: false,
@@ -302,6 +318,7 @@ impl Simulator<Op> {
                 request_number,
                 generation,
             } => self.client_retry_tick(client_id, request_number, generation),
+            WheelEvent::WatchdogTick { node, generation } => self.watchdog_tick(node, generation),
         }
 
         Ok(())
@@ -393,7 +410,7 @@ impl Simulator<Op> {
 
         match to {
             NodeKind::Replica(id) => {
-                let (effects, snapshot) = {
+                let (transition, snapshot) = {
                     let Some(replica) = self.replicas.get_mut(&id) else {
                         debug!(?id, "message to unknown replica dropped");
                         return Err(InvariantViolation {
@@ -404,10 +421,14 @@ impl Simulator<Op> {
                         });
                     };
 
-                    let effects = replica.on_message(message);
+                    let sender = match from {
+                        NodeKind::Replica(id) => MessageSender::Replica(id.0),
+                        NodeKind::Client(id) => MessageSender::Client(id.0),
+                    };
+                    let transition = replica.on_message_from(sender, message);
                     let snapshot = replica.snapshot();
 
-                    (effects, snapshot)
+                    (transition, snapshot)
                 };
 
                 self.history.insert_history_event(
@@ -419,7 +440,7 @@ impl Simulator<Op> {
 
                 self.checker.observe_snapshot(snapshot)?;
 
-                self.apply_effects(to, effects)?;
+                self.apply_transition(to, transition)?;
             }
             NodeKind::Client(id) => {
                 let Some(client) = self.clients.get_mut(&id) else {
@@ -446,6 +467,30 @@ impl Simulator<Op> {
         }
 
         Ok(())
+    }
+
+    fn apply_transition(
+        &mut self,
+        from: NodeKind,
+        transition: Transition<Op, Op>,
+    ) -> Result<(), InvariantViolation> {
+        let Transition {
+            effects,
+            observations,
+        } = transition;
+
+        for observation in observations {
+            self.history
+                .insert_history_event(self.now, RuntimeEvents::ProtocolObserved { observation });
+
+            match observation {
+                ProtocolObservation::PrimaryActivityAccepted { replica, .. } => {
+                    self.reset_watchdog(NodeId(replica));
+                }
+            }
+        }
+
+        self.apply_effects(from, effects)
     }
 
     fn client_request(&mut self, client_id: NodeId, request_number: usize, op: Op) {
@@ -642,6 +687,10 @@ impl Simulator<Op> {
             self.config.heartbeat_interval > 0,
             "heartbeat interval must be greater than zero"
         );
+        assert!(
+            self.config.watchdog_interval > 0,
+            "watchdog interval must be greater than zero"
+        );
 
         let replicas: Vec<NodeId> = self.replicas.keys().copied().collect();
 
@@ -650,6 +699,21 @@ impl Simulator<Op> {
         }
 
         let primary = replicas[0];
+
+        for backup in replicas.iter().copied().filter(|node| *node != primary) {
+            if self.monitors.contains_key(&backup) {
+                continue;
+            }
+
+            self.monitors.insert(
+                backup,
+                ReplicaMonitor {
+                    generation: 0,
+                    expired: false,
+                },
+            );
+            self.schedule_watchdog(backup, 0);
+        }
 
         let at = self
             .now
@@ -697,6 +761,47 @@ impl Simulator<Op> {
                 request_number: pending.request_number,
                 generation: pending.retry_generation,
             },
+        );
+    }
+
+    fn reset_watchdog(&mut self, node: NodeId) {
+        let Some(monitor) = self.monitors.get_mut(&node) else {
+            return;
+        };
+
+        monitor.generation = monitor
+            .generation
+            .checked_add(1)
+            .expect("watchdog generation overflow");
+        monitor.expired = false;
+        let generation = monitor.generation;
+
+        self.history
+            .insert_history_event(self.now, RuntimeEvents::WatchdogReset { node, generation });
+        self.schedule_watchdog(node, generation);
+    }
+
+    fn schedule_watchdog(&mut self, node: NodeId, generation: u64) {
+        let at = self
+            .now
+            .checked_add(self.config.watchdog_interval)
+            .expect("virtual time overflow while scheduling watchdog");
+        self.schedule_event(at, WheelEvent::WatchdogTick { node, generation });
+    }
+
+    fn watchdog_tick(&mut self, node: NodeId, generation: u64) {
+        let Some(monitor) = self.monitors.get_mut(&node) else {
+            return;
+        };
+
+        if monitor.generation != generation || monitor.expired {
+            return;
+        }
+
+        monitor.expired = true;
+        self.history.insert_history_event(
+            self.now,
+            RuntimeEvents::WatchdogExpired { node, generation },
         );
     }
 }
@@ -1596,6 +1701,274 @@ mod tests {
         sim.start_timers();
 
         assert!(sim.wheel.is_empty());
+    }
+
+    #[test]
+    fn start_timers_schedules_watchdogs_for_backups_only() {
+        let mut sim = setup(42, 3, None);
+        sim.create_network_perfect_mesh();
+
+        sim.start_timers();
+
+        assert_eq!(sim.monitors.len(), 2);
+        assert!(!sim.monitors.contains_key(&NodeId(0)));
+        assert!(sim.monitors.contains_key(&NodeId(1)));
+        assert!(sim.monitors.contains_key(&NodeId(2)));
+        assert_eq!(
+            sim.wheel
+                .values()
+                .filter(|event| matches!(event, WheelEvent::WatchdogTick { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn accepted_prepare_resets_backup_watchdog() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 100,
+            watchdog_interval: 50,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        for _ in 0..20 {
+            if sim.monitors[&NodeId(1)].generation > 0 {
+                break;
+            }
+            sim.step().unwrap();
+        }
+
+        assert_eq!(sim.monitors[&NodeId(1)].generation, 1);
+        assert!(!sim.monitors[&NodeId(1)].expired);
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::WatchdogReset {
+                    node: NodeId(1),
+                    generation: 1,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn prepare_gap_still_resets_watchdog_as_primary_activity() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 100,
+            watchdog_interval: 50,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+        let request = ClientRequest {
+            op: Op::Set("k".into(), 7),
+            client_id: 0,
+            request_number: 1,
+            result: None,
+        };
+        sim.schedule_event(
+            1,
+            WheelEvent::Deliver {
+                from: NodeKind::Replica(NodeId(0)),
+                to: NodeKind::Replica(NodeId(1)),
+                message: Message::Prepare {
+                    op: request.op.clone(),
+                    view_number: 0,
+                    op_number: 2,
+                    commit_number: 0,
+                    request: Box::new(request),
+                },
+            },
+        );
+
+        sim.step().unwrap();
+
+        assert_eq!(sim.monitors[&NodeId(1)].generation, 1);
+        assert!(sim.replicas[&NodeId(1)].snapshot().log.is_empty());
+    }
+
+    #[test]
+    fn stale_watchdog_tick_is_ignored() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 100,
+            watchdog_interval: 10,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+        sim.reset_watchdog(NodeId(1));
+
+        sim.step().unwrap();
+
+        assert_eq!(sim.now, 10);
+        assert_eq!(sim.monitors[&NodeId(1)].generation, 1);
+        assert!(!sim.monitors[&NodeId(1)].expired);
+        assert!(!sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::WatchdogExpired {
+                    node: NodeId(1),
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn current_watchdog_generation_expires_once() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 100,
+            watchdog_interval: 10,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+
+        sim.step().unwrap();
+        sim.watchdog_tick(NodeId(1), 0);
+
+        let expirations = sim
+            .history
+            .events()
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    RuntimeEvents::WatchdogExpired {
+                        node: NodeId(1),
+                        generation: 0,
+                    }
+                )
+            })
+            .count();
+        assert_eq!(expirations, 1);
+        assert!(sim.monitors[&NodeId(1)].expired);
+    }
+
+    #[test]
+    fn healthy_heartbeats_prevent_watchdog_expiration() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 5,
+            watchdog_interval: 12,
+            run_until_max_time: 16,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        assert!(sim.monitors.values().all(|monitor| !monitor.expired));
+        assert!(
+            sim.history
+                .events()
+                .iter()
+                .any(|(_, event)| { matches!(event, RuntimeEvents::WatchdogReset { .. }) })
+        );
+        assert!(
+            !sim.history
+                .events()
+                .iter()
+                .any(|(_, event)| { matches!(event, RuntimeEvents::WatchdogExpired { .. }) })
+        );
+    }
+
+    #[test]
+    fn same_seed_same_watchdog_history() {
+        let run = |seed| {
+            let config = SimulatorConfig {
+                heartbeat_interval: 5,
+                watchdog_interval: 12,
+                run_until_max_time: 16,
+                ..Default::default()
+            };
+            let mut sim = setup(seed, 3, Some(config));
+            sim.create_network_perfect_mesh();
+            sim.start_timers();
+            sim.run().unwrap();
+            format!("{:?}", sim.history)
+        };
+
+        assert_eq!(run(42), run(42));
+    }
+
+    #[test]
+    fn dropped_heartbeats_expire_only_the_silent_backup() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 5,
+            watchdog_interval: 12,
+            run_until_max_time: 12,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.network.set_link(
+            NodeKind::Replica(NodeId(0)),
+            NodeKind::Replica(NodeId(1)),
+            Link {
+                drop_probability: 100,
+                ..Default::default()
+            },
+        );
+        sim.start_timers();
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        assert!(sim.monitors[&NodeId(1)].expired);
+        assert!(!sim.monitors[&NodeId(2)].expired);
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::WatchdogExpired {
+                    node: NodeId(1),
+                    generation: 0,
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn wrong_sender_commit_does_not_reset_watchdog() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 100,
+            watchdog_interval: 50,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+        sim.schedule_event(
+            1,
+            WheelEvent::Deliver {
+                from: NodeKind::Replica(NodeId(2)),
+                to: NodeKind::Replica(NodeId(1)),
+                message: Message::Commit {
+                    view_number: 0,
+                    commit_number: 0,
+                },
+            },
+        );
+
+        sim.step().unwrap();
+
+        assert_eq!(sim.monitors[&NodeId(1)].generation, 0);
+        assert!(!sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::WatchdogReset {
+                    node: NodeId(1),
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]

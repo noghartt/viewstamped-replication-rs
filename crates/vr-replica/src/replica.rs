@@ -11,6 +11,7 @@ use crate::snapshot::{
     ClientTableEntrySnapshot, ExecutedRequestSnapshot, LogEntrySnapshot, ReplicaSnapshot,
 };
 use crate::state_machine::StateMachine;
+use crate::transition::{MessageSender, ProtocolObservation, Transition};
 use crate::types::{OpNumber, ReplicaId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,25 +79,61 @@ where
         }
     }
 
-    pub fn on_message(&mut self, message: Message<Input, Output>) -> Vec<Effect<Input, Output>> {
+    pub fn on_message_from(
+        &mut self,
+        sender: MessageSender,
+        message: Message<Input, Output>,
+    ) -> Transition<Input, Output> {
         match message {
-            Message::Request { 0: request } => self.on_request(request),
+            Message::Request { 0: request } => {
+                if sender != MessageSender::Client(request.client_id) {
+                    return Transition::from_effects(Vec::new());
+                }
+
+                Transition::from_effects(self.on_request(request))
+            }
             Message::Prepare {
                 op,
                 view_number,
                 op_number,
                 commit_number,
                 request,
-            } => self.on_prepare(op, request, view_number, op_number, commit_number),
+            } => {
+                let primary = self.primary_for_view(view_number);
+                if sender != MessageSender::Replica(primary) {
+                    return Transition::from_effects(Vec::new());
+                }
+
+                let accepted = self.accepts_primary_activity(sender, view_number);
+                let effects = self.on_prepare(op, request, view_number, op_number, commit_number);
+
+                self.transition_with_primary_activity(effects, accepted, primary)
+            }
             Message::PrepareOk {
                 view_number,
                 replica_number,
                 op_number,
-            } => self.on_prepare_ok(view_number, replica_number, op_number),
+            } => {
+                if sender != MessageSender::Replica(replica_number) {
+                    return Transition::from_effects(Vec::new());
+                }
+
+                Transition::from_effects(self.on_prepare_ok(view_number, replica_number, op_number))
+            }
             Message::Commit {
                 view_number,
                 commit_number,
-            } => self.on_commit(commit_number, view_number),
+            } => {
+                let primary = self.primary_for_view(view_number);
+                if sender != MessageSender::Replica(primary) {
+                    return Transition::from_effects(Vec::new());
+                }
+
+                let accepted = self.accepts_primary_activity(sender, view_number);
+                let effects = self.on_commit(commit_number, view_number);
+
+                self.transition_with_primary_activity(effects, accepted, primary)
+            }
             m => {
                 debug!(
                     ?m,
@@ -104,9 +141,48 @@ where
                     "no mapped message"
                 );
 
-                return Vec::new();
+                Transition::from_effects(Vec::new())
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn on_message(&mut self, message: Message<Input, Output>) -> Transition<Input, Output> {
+        let sender = match &message {
+            Message::Request(request) => MessageSender::Client(request.client_id),
+            Message::Prepare { view_number, .. } | Message::Commit { view_number, .. } => {
+                MessageSender::Replica(self.primary_for_view(*view_number))
+            }
+            Message::PrepareOk { replica_number, .. } => MessageSender::Replica(*replica_number),
+            _ => MessageSender::Replica(self.view_number),
+        };
+
+        self.on_message_from(sender, message)
+    }
+
+    fn transition_with_primary_activity(
+        &self,
+        effects: Vec<Effect<Input, Output>>,
+        accepted: bool,
+        primary: ReplicaId,
+    ) -> Transition<Input, Output> {
+        let observations = accepted
+            .then_some(ProtocolObservation::PrimaryActivityAccepted {
+                replica: self.replica_number,
+                primary,
+                view_number: self.view_number,
+            })
+            .into_iter()
+            .collect();
+
+        Transition::new(effects, observations)
+    }
+
+    fn accepts_primary_activity(&self, sender: MessageSender, view_number: ReplicaId) -> bool {
+        self.status == Status::Normal
+            && !self.is_primary()
+            && self.is_same_view(view_number)
+            && sender == MessageSender::Replica(self.primary_for_view(view_number))
     }
 
     fn on_request(&mut self, request: ClientRequest<Input, Output>) -> Vec<Effect<Input, Output>> {
@@ -216,7 +292,7 @@ where
             };
 
             effects.push(Effect::Send {
-                to: self.view_number,
+                to: self.primary_for_view(self.view_number),
                 message: prepare_ok,
             });
         } else if op_number <= self.log.len() {
@@ -227,7 +303,7 @@ where
 
             if matches {
                 effects.push(Effect::Send {
-                    to: self.view_number,
+                    to: self.primary_for_view(self.view_number),
                     message: Message::PrepareOk {
                         view_number: self.view_number,
                         replica_number: self.replica_number,
@@ -304,7 +380,12 @@ where
 
     #[inline]
     fn is_primary(&self) -> bool {
-        self.view_number == self.replica_number
+        self.primary_for_view(self.view_number) == self.replica_number
+    }
+
+    fn primary_for_view(&self, view_number: ReplicaId) -> ReplicaId {
+        let index = (view_number as usize) % self.configuration.len();
+        self.configuration[index]
     }
 
     fn is_same_view(&self, view_number: ReplicaId) -> bool {
@@ -457,6 +538,16 @@ mod tests {
         let b = replica.snapshot();
 
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn primary_selection_wraps_view_number_across_configuration() {
+        let sm = Rc::new(RefCell::new(KvState::default()));
+        let mut replica = Replica::new(vec![0, 1, 2], 0, sm);
+        replica.view_number = 3;
+
+        assert_eq!(replica.primary_for_view(3), 0);
+        assert!(replica.is_primary());
     }
 
     #[test]
@@ -1353,6 +1444,108 @@ mod tests {
         assert_eq!(primary.snapshot(), before);
         assert_eq!(primary.op_ack_table, ack_table_before);
         assert!(sm.borrow().applied.is_empty());
+    }
+
+    #[test]
+    fn valid_prepare_observes_primary_activity() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
+        let request = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 1,
+            result: None,
+        };
+
+        let transition = backup.on_message_from(
+            MessageSender::Replica(0),
+            prepare(String::from("a"), 1, 0, request),
+        );
+
+        assert_eq!(
+            transition.observations,
+            vec![ProtocolObservation::PrimaryActivityAccepted {
+                replica: 1,
+                primary: 0,
+                view_number: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn matching_duplicate_prepare_observes_primary_activity() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
+        let request = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 1,
+            result: None,
+        };
+        backup.on_message(prepare(String::from("a"), 1, 0, request.clone()));
+
+        let transition = backup.on_message_from(
+            MessageSender::Replica(0),
+            prepare(String::from("a"), 1, 0, request),
+        );
+
+        assert_eq!(transition.observations.len(), 1);
+    }
+
+    #[test]
+    fn valid_duplicate_commit_observes_primary_activity() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
+
+        let first = backup.on_message_from(MessageSender::Replica(0), commit(0, 0));
+        let duplicate = backup.on_message_from(MessageSender::Replica(0), commit(0, 0));
+
+        assert_eq!(first.observations.len(), 1);
+        assert_eq!(duplicate.observations.len(), 1);
+        assert!(duplicate.effects.is_empty());
+    }
+
+    #[test]
+    fn wrong_sender_is_rejected_but_prepare_gap_still_observes_primary_activity() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm);
+        let request = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 1,
+            result: None,
+        };
+        let before = backup.snapshot();
+
+        let wrong_sender = backup.on_message_from(
+            MessageSender::Replica(2),
+            prepare(String::from("a"), 1, 0, request.clone()),
+        );
+        let gap = backup.on_message_from(
+            MessageSender::Replica(0),
+            prepare(String::from("a"), 2, 0, request),
+        );
+
+        assert!(wrong_sender.effects.is_empty());
+        assert!(wrong_sender.observations.is_empty());
+        assert_eq!(backup.snapshot(), before);
+        assert!(gap.effects.is_empty());
+        assert_eq!(gap.observations.len(), 1);
+    }
+
+    #[test]
+    fn sender_identity_must_match_client_request_and_prepare_ok_payloads() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut primary = Replica::new(vec![0, 1, 2], 0, sm);
+
+        let wrong_client = primary.on_message_from(MessageSender::Client(20), request(10, 1, "a"));
+        assert!(wrong_client.effects.is_empty());
+        assert!(primary.snapshot().log.is_empty());
+
+        primary.on_message(request(10, 1, "a"));
+        let wrong_replica = primary.on_message_from(MessageSender::Replica(2), prepare_ok(1, 1));
+        assert!(wrong_replica.effects.is_empty());
+        assert_eq!(primary.snapshot().commit_number, 0);
     }
 
     #[test]

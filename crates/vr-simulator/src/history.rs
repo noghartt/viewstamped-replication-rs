@@ -1,5 +1,6 @@
 use std::fmt;
 
+use vr_replica::transition::ProtocolObservation;
 use vr_replica::{effect::Effect, message::Message, snapshot::ReplicaSnapshot, types::ReplicaId};
 
 use crate::{
@@ -43,6 +44,17 @@ pub enum RuntimeEvents<
     ClientRetried {
         client: NodeId,
         request_number: usize,
+        generation: u64,
+    },
+    ProtocolObserved {
+        observation: ProtocolObservation,
+    },
+    WatchdogReset {
+        node: NodeId,
+        generation: u64,
+    },
+    WatchdogExpired {
+        node: NodeId,
         generation: u64,
     },
 }
@@ -222,6 +234,23 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                         f,
                         "[t={at:>5}]   C{:?} request_number={request_number} generation={generation}",
                         client,
+                    )?;
+                }
+                RuntimeEvents::ProtocolObserved { observation } => {
+                    writeln!(f, "[t={at:>5}] protocol observation {observation:?}")?;
+                }
+                RuntimeEvents::WatchdogReset { node, generation } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]   R{} watchdog reset generation={generation}",
+                        node.0,
+                    )?;
+                }
+                RuntimeEvents::WatchdogExpired { node, generation } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]   R{} watchdog expired generation={generation}",
+                        node.0,
                     )?;
                 }
             }

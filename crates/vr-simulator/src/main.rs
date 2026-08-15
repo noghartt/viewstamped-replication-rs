@@ -86,6 +86,9 @@ struct CliConfig {
 
     #[arg(long, default_value_t = 1_000)]
     client_retry_interval: u64,
+
+    #[arg(long, default_value_t = 500)]
+    watchdog_interval: u64,
 }
 
 enum Mode {
@@ -153,11 +156,16 @@ fn setup_simulation(seed: u64, config: &CliConfig) -> Simulator<Op> {
         run_until_max_events: config.run_until_max_events,
         heartbeat_interval: config.heartbeat_interval,
         client_retry_interval: config.client_retry_interval,
+        watchdog_interval: config.watchdog_interval,
     };
 
     assert!(
         config.client_retry_interval > 0,
         "client retry interval must be nonzero"
+    );
+    assert!(
+        config.watchdog_interval > 0,
+        "watchdog interval must be nonzero"
     );
 
     let mut simulator = Simulator::with_seed(seed, Some(simulator_config));
