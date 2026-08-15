@@ -269,9 +269,14 @@ impl Simulator<Op> {
                     (effects, snapshot)
                 };
 
-                self.checker.observe_snapshot(snapshot.clone());
-                self.history
-                    .insert_history_event(self.now, RuntimeEvents::ReplicaSnapshot { snapshot });
+                self.history.insert_history_event(
+                    self.now,
+                    RuntimeEvents::ReplicaSnapshot {
+                        snapshot: snapshot.clone(),
+                    },
+                );
+
+                self.checker.observe_snapshot(snapshot)?;
 
                 self.apply_effects(to, effects)?;
             }
