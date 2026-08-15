@@ -1082,12 +1082,32 @@ mod tests {
 
         assert_eq!(replica_snapshot.commit_number, 1);
         assert_eq!(replica_snapshot.op_number, 1);
+        assert_eq!(replica_snapshot.epoch, 0);
         assert_eq!(replica_snapshot.log.len(), 1);
 
         let entry = &replica_snapshot.log[0];
         assert_eq!(entry.op_number, 1);
         assert_eq!(entry.client_id, 0);
         assert_eq!(entry.request_number, 1);
+        assert_eq!(entry.op, Op::Set("k".into(), 7));
+        assert_eq!(replica_snapshot.executed_requests.len(), 1);
+        assert_eq!(replica_snapshot.executed_requests[0].client_id, 0);
+        assert_eq!(replica_snapshot.executed_requests[0].request_number, 1);
+        assert_eq!(
+            replica_snapshot.executed_requests[0].op,
+            Op::Set("k".into(), 7)
+        );
+        assert_eq!(
+            replica_snapshot.executed_requests[0].result,
+            Op::Set("k".into(), 7)
+        );
+        assert_eq!(replica_snapshot.client_table.len(), 1);
+        assert_eq!(replica_snapshot.client_table[0].client_id, 0);
+        assert_eq!(replica_snapshot.client_table[0].request_number, 1);
+        assert_eq!(
+            replica_snapshot.client_table[0].result,
+            Some(Op::Set("k".into(), 7))
+        );
 
         let clients = sim.get_clients();
         assert_eq!(clients.len(), 1);
@@ -1117,6 +1137,41 @@ mod tests {
                 } if key == "k"
             )
         }));
+    }
+
+    #[test]
+    fn sequential_requests_from_one_client_preserve_client_table_and_execute_once() {
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            run_until_max_time: 21,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        sim.start_timers();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 1)));
+
+        while sim.clients[&NodeId(0)].has_pending_request() {
+            sim.step().unwrap();
+        }
+
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 2)));
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
+
+        for replica in sim.replicas.values() {
+            let snapshot = replica.snapshot();
+            assert_eq!(snapshot.commit_number, 2);
+            assert_eq!(snapshot.executed_requests.len(), 2);
+            assert_eq!(snapshot.client_table.len(), 1);
+            assert_eq!(snapshot.client_table[0].request_number, 2);
+            assert_eq!(
+                snapshot.client_table[0].result,
+                Some(Op::Set("k".into(), 2))
+            );
+        }
+
+        assert_eq!(sim.clients[&NodeId(0)].replies_received, 2);
+        assert_eq!(sim.clients[&NodeId(0)].state.get("k"), Some(&2));
     }
 
     #[test]

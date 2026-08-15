@@ -7,7 +7,9 @@ use tracing::debug;
 
 use crate::effect::Effect;
 use crate::message::{ClientRequest, Message};
-use crate::snapshot::{LogEntrySnapshot, ReplicaSnapshot};
+use crate::snapshot::{
+    ClientTableEntrySnapshot, ExecutedRequestSnapshot, LogEntrySnapshot, ReplicaSnapshot,
+};
 use crate::state_machine::StateMachine;
 use crate::types::{OpNumber, ReplicaId};
 
@@ -40,6 +42,7 @@ where
     // request has already been executed by the replica. If yes, I should store the result
     // which have been returned by this replica.
     client_table: BTreeMap<u64, ClientRequest<Input, Output>>,
+    executed_requests: Vec<ExecutedRequestSnapshot<Input, Output>>,
 
     op_ack_table: BTreeMap<ReplicaId, OpNumber>,
 
@@ -70,6 +73,7 @@ where
             status: Status::Normal,
             log: Vec::new(),
             client_table: BTreeMap::new(),
+            executed_requests: Vec::new(),
             op_ack_table: BTreeMap::new(),
         }
     }
@@ -326,10 +330,23 @@ where
         let result = sm.borrow_mut().apply(request.op.clone());
         let mut request = request.clone();
 
+        self.executed_requests.push(ExecutedRequestSnapshot {
+            client_id: request.client_id,
+            request_number: request.request_number,
+            op: request.op.clone(),
+            result: result.clone(),
+        });
+
         request.result = Some(result.clone());
 
         self.commit_number = op_number;
-        self.client_table.insert(request.client_id, request.clone());
+        let should_update_client_table = self
+            .client_table
+            .get(&request.client_id)
+            .is_none_or(|latest| latest.request_number <= request.request_number);
+        if should_update_client_table {
+            self.client_table.insert(request.client_id, request.clone());
+        }
 
         (op_number, result, request)
     }
@@ -362,9 +379,10 @@ where
         committed
     }
 
-    pub fn snapshot(&self) -> ReplicaSnapshot {
+    pub fn snapshot(&self) -> ReplicaSnapshot<Input, Output> {
         ReplicaSnapshot {
             replica_number: self.replica_number,
+            epoch: self.epoch,
             status: self.status.clone(),
             view_number: self.view_number,
             op_number: self.op_number,
@@ -376,8 +394,20 @@ where
                     op_number: *op_number,
                     client_id: request.client_id,
                     request_number: request.request_number,
+                    op: request.op.clone(),
                 })
                 .collect(),
+            client_table: self
+                .client_table
+                .iter()
+                .map(|(client_id, request)| ClientTableEntrySnapshot {
+                    client_id: *client_id,
+                    request_number: request.request_number,
+                    op: request.op.clone(),
+                    result: request.result.clone(),
+                })
+                .collect(),
+            executed_requests: self.executed_requests.clone(),
         }
     }
 }
@@ -408,11 +438,14 @@ mod tests {
         let snapshot = replica.snapshot();
 
         assert_eq!(snapshot.replica_number, 0);
+        assert_eq!(snapshot.epoch, 0);
         assert_eq!(snapshot.status, Status::Normal);
         assert_eq!(snapshot.view_number, 0);
         assert_eq!(snapshot.op_number, 0);
         assert_eq!(snapshot.commit_number, 0);
         assert!(snapshot.log.is_empty());
+        assert!(snapshot.client_table.is_empty());
+        assert!(snapshot.executed_requests.is_empty());
     }
 
     #[test]
@@ -438,6 +471,24 @@ mod tests {
         let effects_b = primary.on_message(prepare_ok(2, 2));
 
         assert_eq!(primary.snapshot().commit_number, 2);
+        assert_eq!(
+            primary.snapshot().executed_requests,
+            vec![
+                ExecutedRequestSnapshot {
+                    client_id: 1,
+                    request_number: 1,
+                    op: "a".to_string(),
+                    result: "applied-a".to_string(),
+                },
+                ExecutedRequestSnapshot {
+                    client_id: 2,
+                    request_number: 1,
+                    op: "b".to_string(),
+                    result: "applied-b".to_string(),
+                },
+            ]
+        );
+        assert_eq!(primary.snapshot().log[0].op, "a");
         assert_eq!(sm.borrow().applied, vec!["a".to_string(), "b".to_string()]);
 
         let replied_to: Vec<u64> = effects_a
@@ -784,6 +835,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn committing_older_request_does_not_regress_backup_client_table() {
+        let sm = Rc::new(RefCell::new(RecordingSm::default()));
+        let mut backup = Replica::new(vec![0, 1, 2], 1, sm.clone());
+        let first = ClientRequest {
+            client_id: 10,
+            op: String::from("a"),
+            request_number: 1,
+            result: None,
+        };
+        let second = ClientRequest {
+            client_id: 10,
+            op: String::from("b"),
+            request_number: 2,
+            result: None,
+        };
+
+        backup.on_message(prepare(String::from("a"), 1, 0, first));
+        backup.on_message(prepare(String::from("b"), 2, 1, second));
+
+        let snapshot = backup.snapshot();
+        assert_eq!(snapshot.commit_number, 1);
+        assert_eq!(snapshot.client_table.len(), 1);
+        assert_eq!(snapshot.client_table[0].request_number, 2);
+        assert_eq!(snapshot.client_table[0].op, "b");
+        assert_eq!(snapshot.client_table[0].result, None);
+        assert_eq!(sm.borrow().applied, vec!["a".to_string()]);
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub enum RuntimeEvents<
         effect: Effect<Input, Output>,
     },
     ReplicaSnapshot {
-        snapshot: ReplicaSnapshot,
+        snapshot: ReplicaSnapshot<Input, Output>,
     },
     ClientInvoked {
         client: NodeId,
