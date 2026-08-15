@@ -46,7 +46,10 @@ impl Client {
         self.configuration[(self.current_view as usize) % self.configuration.len()]
     }
 
-    pub fn on_message<I: std::fmt::Debug>(&mut self, message: Message<I, Op>) {
+    pub fn on_message<I: std::fmt::Debug>(
+        &mut self,
+        message: Message<I, Op>,
+    ) -> Option<(usize, Op)> {
         match message {
             Message::Reply {
                 result,
@@ -55,28 +58,33 @@ impl Client {
                 ..
             } => {
                 if client_id != self.id.0 {
-                    return;
+                    return None;
                 }
 
                 let Some(pending_request) = self.pending_request else {
-                    return;
+                    return None;
                 };
 
                 if request_id != pending_request {
-                    return;
+                    return None;
                 }
+
+                let op = result?;
 
                 self.request_number = pending_request;
                 self.pending_request = None;
                 self.replies_received += 1;
 
-                if let Some(op) = result {
-                    self.apply_op(op);
-                }
+                self.apply_op(op.clone());
+
+                Some((request_id, op))
             }
             // VR's rule for unexpected messages is ignore-and-drop; a panic
             // here would kill an entire seed campaign on one stray message.
-            other => tracing::debug!(?other, "client ignoring unexpected message"),
+            other => {
+                tracing::debug!(?other, "client ignoring unexpected message");
+                None
+            }
         }
     }
 
@@ -164,7 +172,10 @@ mod tests {
             result: Some(Op::Set("k".into(), 1)),
         };
 
-        client.on_message::<Op>(reply);
+        assert_eq!(
+            client.on_message::<Op>(reply),
+            Some((1, Op::Set("k".into(), 1)))
+        );
 
         assert_eq!(client.pending_request, None);
         assert_eq!(client.request_number, 1);
@@ -188,13 +199,13 @@ mod tests {
             result: Some(Op::Set("k".into(), 1)),
         };
 
-        client.on_message::<Op>(reply.clone());
+        assert!(client.on_message::<Op>(reply.clone()).is_some());
 
         assert_eq!(client.pending_request, None);
         assert_eq!(client.request_number, 1);
         assert_eq!(client.replies_received, 1);
 
-        client.on_message::<Op>(reply);
+        assert!(client.on_message::<Op>(reply).is_none());
 
         assert_eq!(client.pending_request, None);
         assert_eq!(client.request_number, 1);
@@ -219,7 +230,7 @@ mod tests {
             result: Some(Op::Set("k".into(), 1)),
         };
 
-        client.on_message::<Op>(reply.clone());
+        assert!(client.on_message::<Op>(reply).is_none());
 
         assert_eq!(client.pending_request, Some(2));
         assert_eq!(client.request_number, 1);
@@ -242,10 +253,28 @@ mod tests {
             result: Some(Op::Set("k".into(), 1)),
         };
 
-        client.on_message::<Op>(reply.clone());
+        assert!(client.on_message::<Op>(reply).is_none());
 
         assert_eq!(client.pending_request, Some(1));
         assert_eq!(client.request_number, 0);
+        assert!(client.state.is_empty());
+    }
+
+    #[test]
+    fn ignores_matching_reply_without_result() {
+        let mut client = Client::new(NodeId(0), vec![0, 1, 2]);
+        let request_number = client.lock_request_number();
+        let reply = Message::<Op, Op>::Reply {
+            client_id: 0,
+            view_number: 0,
+            request_id: request_number,
+            result: None,
+        };
+
+        assert!(client.on_message::<Op>(reply).is_none());
+        assert_eq!(client.pending_request, Some(request_number));
+        assert_eq!(client.request_number, 0);
+        assert_eq!(client.replies_received, 0);
         assert!(client.state.is_empty());
     }
 
@@ -269,7 +298,7 @@ mod tests {
             result: Some(Op::Set("k".into(), 1)),
         };
 
-        client.on_message::<Op>(reply);
+        assert!(client.on_message::<Op>(reply).is_some());
 
         assert_eq!(client.pending_request, None);
         assert_eq!(client.request_number, 1);
@@ -288,7 +317,7 @@ mod tests {
             result: Some(Op::Set("k".into(), 1)),
         };
 
-        client.on_message::<Op>(reply);
+        assert!(client.on_message::<Op>(reply).is_some());
 
         assert_eq!(client.pending_request, None);
         assert_eq!(client.request_number, 2);

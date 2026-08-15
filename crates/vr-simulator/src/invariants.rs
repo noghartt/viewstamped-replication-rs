@@ -25,12 +25,15 @@ impl StateChecker {
     ) -> Result<(), InvariantViolation> {
         let replica = snapshot.replica_number;
 
+        Self::check_commit_within_log(&snapshot)?;
         Self::check_no_duplicate_requests(&snapshot)?;
 
         if let Some(previous) = self.snapshots.get(&replica) {
             Self::check_commit_monotonicity(previous, &snapshot)?;
             Self::check_view_monotonicity(previous, &snapshot)?;
         }
+
+        self.check_same_committed_prefix(&snapshot)?;
 
         self.snapshots.insert(replica, snapshot);
 
@@ -141,6 +144,58 @@ impl StateChecker {
 
         Ok(())
     }
+
+    fn check_commit_within_log(snapshot: &ReplicaSnapshot) -> Result<(), InvariantViolation> {
+        if snapshot.commit_number > snapshot.log.len() {
+            return Err(InvariantViolation {
+                invariant: "commit_within_log",
+                replica: snapshot.replica_number,
+                details: format!(
+                    "commit_number={} exceeds log length={}",
+                    snapshot.commit_number,
+                    snapshot.log.len(),
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn check_same_committed_prefix(
+        &self,
+        current: &ReplicaSnapshot,
+    ) -> Result<(), InvariantViolation> {
+        for (other_id, other) in &self.snapshots {
+            if *other_id == current.replica_number {
+                continue;
+            }
+
+            let shared_commit = current.commit_number.min(other.commit_number);
+
+            for index in 0..shared_commit {
+                let current_entry = &current.log[index];
+                let other_entry = &other.log[index];
+
+                if current_entry != other_entry {
+                    return Err(InvariantViolation {
+                        invariant: "same_committed_prefix",
+                        replica: current.replica_number,
+                        details: format!(
+                            "replicas {} and {} disagree at committed op {}: \
+                         current={:?}, other={:?}",
+                            current.replica_number,
+                            other.replica_number,
+                            index + 1,
+                            current_entry,
+                            other_entry,
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -154,13 +209,17 @@ mod tests {
         view_number: ReplicaId,
         commit_number: usize,
     ) -> ReplicaSnapshot {
+        let log = (1..=commit_number)
+            .map(|op_number| log_entry(op_number, op_number as u64, 1))
+            .collect();
+
         ReplicaSnapshot {
             replica_number: replica,
             status: Status::Normal,
             view_number,
             op_number: commit_number,
             commit_number,
-            log: vec![],
+            log,
         }
     }
 
@@ -171,6 +230,21 @@ mod tests {
             view_number: 0,
             op_number: log.len(),
             commit_number: 0,
+            log,
+        }
+    }
+
+    fn snapshot_with_committed_log(
+        replica: ReplicaId,
+        commit_number: usize,
+        log: Vec<LogEntrySnapshot>,
+    ) -> ReplicaSnapshot {
+        ReplicaSnapshot {
+            replica_number: replica,
+            status: Status::Normal,
+            view_number: 0,
+            op_number: log.len(),
+            commit_number,
             log,
         }
     }
@@ -366,5 +440,136 @@ mod tests {
         assert_eq!(violation.replica, 3);
         assert!(violation.details.contains("client=10"));
         assert!(violation.details.contains("request=7"));
+    }
+
+    #[test]
+    fn equal_committed_prefixes_are_allowed() {
+        let mut checker = StateChecker::new();
+        let log = vec![log_entry(1, 10, 7), log_entry(2, 20, 7)];
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(0, 2, log.clone()))
+            .unwrap();
+        checker
+            .observe_snapshot(snapshot_with_committed_log(1, 2, log))
+            .unwrap();
+    }
+
+    #[test]
+    fn different_uncommitted_suffixes_are_allowed() {
+        let mut checker = StateChecker::new();
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(
+                0,
+                1,
+                vec![log_entry(1, 10, 7), log_entry(2, 20, 7)],
+            ))
+            .unwrap();
+        checker
+            .observe_snapshot(snapshot_with_committed_log(
+                1,
+                1,
+                vec![log_entry(1, 10, 7), log_entry(2, 30, 7)],
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn different_commit_numbers_with_equal_shared_prefix_are_allowed() {
+        let mut checker = StateChecker::new();
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(
+                0,
+                2,
+                vec![log_entry(1, 10, 7), log_entry(2, 20, 7)],
+            ))
+            .unwrap();
+        checker
+            .observe_snapshot(snapshot_with_committed_log(1, 1, vec![log_entry(1, 10, 7)]))
+            .unwrap();
+    }
+
+    #[test]
+    fn conflicting_committed_entries_are_rejected() {
+        let mut checker = StateChecker::new();
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(
+                0,
+                2,
+                vec![log_entry(1, 10, 7), log_entry(2, 20, 7)],
+            ))
+            .unwrap();
+        let violation = checker
+            .observe_snapshot(snapshot_with_committed_log(
+                1,
+                2,
+                vec![log_entry(1, 10, 7), log_entry(2, 30, 7)],
+            ))
+            .unwrap_err();
+
+        assert_eq!(violation.invariant, "same_committed_prefix");
+        assert_eq!(violation.replica, 1);
+        assert!(violation.details.contains("committed op 2"));
+    }
+
+    #[test]
+    fn conflict_inside_differently_sized_committed_prefix_is_rejected() {
+        let mut checker = StateChecker::new();
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(
+                0,
+                3,
+                vec![
+                    log_entry(1, 10, 7),
+                    log_entry(2, 20, 7),
+                    log_entry(3, 30, 7),
+                ],
+            ))
+            .unwrap();
+        let violation = checker
+            .observe_snapshot(snapshot_with_committed_log(
+                1,
+                2,
+                vec![log_entry(1, 10, 7), log_entry(2, 40, 7)],
+            ))
+            .unwrap_err();
+
+        assert_eq!(violation.invariant, "same_committed_prefix");
+        assert!(violation.details.contains("committed op 2"));
+    }
+
+    #[test]
+    fn commit_number_beyond_log_is_rejected_without_panicking() {
+        let mut checker = StateChecker::new();
+        let malformed = snapshot_with_committed_log(3, 2, vec![log_entry(1, 10, 7)]);
+
+        let violation = checker.observe_snapshot(malformed).unwrap_err();
+
+        assert_eq!(violation.invariant, "commit_within_log");
+        assert_eq!(violation.replica, 3);
+    }
+
+    #[test]
+    fn rejected_conflicting_prefix_does_not_replace_previous_snapshot() {
+        let mut checker = StateChecker::new();
+        let valid_log = vec![log_entry(1, 10, 7)];
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(0, 1, valid_log.clone()))
+            .unwrap();
+        checker
+            .observe_snapshot(snapshot_with_committed_log(1, 1, valid_log.clone()))
+            .unwrap();
+        checker
+            .observe_snapshot(snapshot_with_committed_log(1, 1, vec![log_entry(1, 20, 7)]))
+            .unwrap_err();
+
+        checker
+            .observe_snapshot(snapshot_with_committed_log(2, 1, valid_log))
+            .unwrap();
     }
 }

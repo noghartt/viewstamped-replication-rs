@@ -1,6 +1,6 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tracing::{debug, info, trace};
 
 use vr_replica::effect::Effect;
@@ -94,6 +94,7 @@ pub struct Simulator<Input: Clone + std::fmt::Debug + 'static> {
     network: Network,
     pub history: History<Input, Op>,
     checker: StateChecker,
+    fault_free_network: bool,
 
     replicas: Replicas<Input, Op>,
     clients: Clients,
@@ -119,6 +120,7 @@ impl Simulator<Op> {
             clients: BTreeMap::new(),
             config: config.unwrap_or_default(),
             checker: StateChecker::new(),
+            fault_free_network: false,
 
             wheel: BTreeMap::new(),
             events_processed: 0,
@@ -131,19 +133,129 @@ impl Simulator<Op> {
 
         loop {
             let Some(&(next_at, _, _)) = self.wheel.keys().next() else {
-                return Ok(SimulatorRunOutcome::Quiesced);
+                return self.finish_run(SimulatorRunOutcome::Quiesced);
             };
 
             if self.events_processed >= self.config.run_until_max_events {
-                return Ok(SimulatorRunOutcome::EventLimit);
+                return self.finish_run(SimulatorRunOutcome::EventLimit);
             }
 
             if next_at > self.config.run_until_max_time {
-                return Ok(SimulatorRunOutcome::TimeLimit);
+                return self.finish_run(SimulatorRunOutcome::TimeLimit);
             }
 
             self.step()?;
         }
+    }
+
+    fn finish_run(
+        &self,
+        outcome: SimulatorRunOutcome,
+    ) -> Result<SimulatorRunOutcome, InvariantViolation> {
+        if self.fault_free_network {
+            self.check_client_progress()?;
+            self.check_final_convergence()?;
+        }
+
+        Ok(outcome)
+    }
+
+    fn check_client_progress(&self) -> Result<(), InvariantViolation> {
+        let mut invoked = BTreeSet::new();
+        let mut completed = BTreeSet::new();
+
+        for (_, event) in self.history.events() {
+            match event {
+                RuntimeEvents::ClientInvoked {
+                    client,
+                    request_number,
+                    ..
+                } => {
+                    invoked.insert((*client, *request_number));
+                }
+                RuntimeEvents::ClientCompleted {
+                    client,
+                    request_number,
+                    ..
+                } => {
+                    completed.insert((*client, *request_number));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((client, request_number)) = invoked.difference(&completed).next() {
+            return Err(InvariantViolation {
+                invariant: "fault_free_progress",
+                replica: client.0,
+                details: format!(
+                    "client={} request={} was invoked but did not complete before the run ended",
+                    client.0, request_number,
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn check_final_convergence(&self) -> Result<(), InvariantViolation> {
+        let Some((baseline_id, baseline_replica)) = self.replicas.first_key_value() else {
+            return Ok(());
+        };
+        let baseline = baseline_replica.snapshot();
+        let Some(baseline_prefix) = baseline.log.get(..baseline.commit_number) else {
+            return Err(InvariantViolation {
+                invariant: "final_convergence",
+                replica: baseline_id.0,
+                details: format!(
+                    "replica {} ended with commit_number={} beyond log length={}",
+                    baseline_id.0,
+                    baseline.commit_number,
+                    baseline.log.len(),
+                ),
+            });
+        };
+
+        for (replica_id, replica) in self.replicas.iter().skip(1) {
+            let snapshot = replica.snapshot();
+
+            if snapshot.commit_number != baseline.commit_number {
+                return Err(InvariantViolation {
+                    invariant: "final_convergence",
+                    replica: replica_id.0,
+                    details: format!(
+                        "replica {} ended at commit_number={}, but replica {} ended at commit_number={}",
+                        replica_id.0, snapshot.commit_number, baseline_id.0, baseline.commit_number,
+                    ),
+                });
+            }
+
+            let Some(committed_prefix) = snapshot.log.get(..snapshot.commit_number) else {
+                return Err(InvariantViolation {
+                    invariant: "final_convergence",
+                    replica: replica_id.0,
+                    details: format!(
+                        "replica {} ended with commit_number={} beyond log length={}",
+                        replica_id.0,
+                        snapshot.commit_number,
+                        snapshot.log.len(),
+                    ),
+                });
+            };
+
+            if committed_prefix != baseline_prefix {
+                return Err(InvariantViolation {
+                    invariant: "final_convergence",
+                    replica: replica_id.0,
+                    details: format!(
+                        "replica {} has a different committed prefix than replica {} at commit_number={}",
+                        replica_id.0, baseline_id.0, baseline.commit_number,
+                    ),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn step(&mut self) -> Result<(), InvariantViolation> {
@@ -199,6 +311,15 @@ impl Simulator<Op> {
             WheelEvent::ClientRequest {
                 client_id,
                 request_number,
+                op: op.clone(),
+            },
+        );
+
+        self.history.insert_history_event(
+            self.now,
+            RuntimeEvents::ClientInvoked {
+                client: client_id,
+                request_number,
                 op,
             },
         );
@@ -222,11 +343,13 @@ impl Simulator<Op> {
         );
 
         self.network = network;
+        self.fault_free_network = false;
     }
 
     pub fn create_network_perfect_mesh(&mut self) {
         let network = Network::full_mesh_perfect(self.replicas.clone(), self.clients.clone());
         self.network = network;
+        self.fault_free_network = true;
     }
 
     fn deliver(
@@ -290,7 +413,17 @@ impl Simulator<Op> {
                         details: String::from("Attempt to sent to unnown replica ID"),
                     });
                 };
-                client.on_message(message);
+
+                if let Some((request_number, result)) = client.on_message(message) {
+                    self.history.insert_history_event(
+                        self.now,
+                        RuntimeEvents::ClientCompleted {
+                            client: client.id,
+                            request_number,
+                            result,
+                        },
+                    );
+                }
             }
         }
 
@@ -642,7 +775,17 @@ mod tests {
         assert_eq!(s.now, 0);
         assert_eq!(s.events_processed, 0);
         assert_eq!(s.wheel.len(), 1);
-        assert!(s.history.events().is_empty());
+        assert!(matches!(
+            s.history.events(),
+            [(
+                0,
+                RuntimeEvents::ClientInvoked {
+                    client: NodeId(0),
+                    request_number: 1,
+                    ..
+                }
+            )]
+        ));
 
         let output = s.run().unwrap();
 
@@ -650,6 +793,23 @@ mod tests {
         assert_eq!(s.events_processed, 1);
         assert!(!s.wheel.is_empty());
         assert_eq!(output, SimulatorRunOutcome::TimeLimit)
+    }
+
+    #[test]
+    fn time_limit_checks_fault_free_progress() {
+        let config = SimulatorConfig {
+            run_until_max_time: 0,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
+        sim.create_network_perfect_mesh();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        let violation = sim.run().unwrap_err();
+
+        assert_eq!(violation.invariant, "fault_free_progress");
+        assert_eq!(sim.events_processed, 1);
+        assert!(!sim.wheel.is_empty());
     }
 
     #[test]
@@ -675,7 +835,7 @@ mod tests {
         assert_eq!(sim.events_processed, 1);
 
         assert!(matches!(
-            sim.history.events().first(),
+            sim.history.events().get(1),
             Some((
                 0,
                 RuntimeEvents::NetworkDelivered {
@@ -836,11 +996,11 @@ mod tests {
         let mut s = setup(42, 3, Some(config));
         s.create_network_perfect_mesh();
         s.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-        let output = s.run().unwrap();
+        let violation = s.run().unwrap_err();
 
         assert_eq!(s.events_processed, 5);
         assert!(!s.wheel.is_empty());
-        assert_eq!(output, SimulatorRunOutcome::EventLimit)
+        assert_eq!(violation.invariant, "fault_free_progress");
     }
 
     #[test]
@@ -866,9 +1026,15 @@ mod tests {
 
     #[test]
     fn records_replica_snapshot_after_delivery() {
-        let mut sim = setup(42, 3, None);
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(42, 3, Some(config));
         sim.create_network_perfect_mesh();
         sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
+        sim.start_timers();
         sim.run().unwrap();
 
         assert!(sim.history.events().iter().any(|(_, event)| {
@@ -883,13 +1049,33 @@ mod tests {
     }
 
     #[test]
+    fn quiescent_fault_free_run_checks_final_convergence() {
+        let mut sim = setup(42, 3, None);
+        sim.create_network_perfect_mesh();
+        assert!(sim.start_client_request(NodeId(0), Op::Set("k".into(), 7)));
+
+        let violation = sim.run().unwrap_err();
+
+        assert_eq!(violation.invariant, "final_convergence");
+        assert_eq!(sim.clients[&NodeId(0)].replies_received, 1);
+        assert!(sim.wheel.is_empty());
+    }
+
+    #[test]
     fn smoke_perfect_mesh_commits_and_replies_once() {
         const SEED: u64 = 4_789_780_388_901_646_590;
 
-        let mut sim = setup(SEED, 3, None);
+        let config = SimulatorConfig {
+            heartbeat_interval: 10,
+            run_until_max_time: 11,
+            ..Default::default()
+        };
+        let mut sim = setup(SEED, 3, Some(config));
         sim.create_network_perfect_mesh();
         sim.start_client_request(NodeId(0), Op::Set("k".into(), 7));
-        sim.run().unwrap();
+        sim.start_timers();
+
+        assert_eq!(sim.run().unwrap(), SimulatorRunOutcome::TimeLimit);
 
         let replica_primary = sim.replicas.get(&NodeId(0)).expect("primary should exist");
         let replica_snapshot = replica_primary.snapshot();
@@ -910,6 +1096,27 @@ mod tests {
         assert_eq!(client.replies_received, 1);
         assert_eq!(client.request_number, 1);
         assert_eq!(client.state.get("k"), Some(&7));
+
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::ClientInvoked {
+                    client: NodeId(0),
+                    request_number: 1,
+                    op: Op::Set(key, 7),
+                } if key == "k"
+            )
+        }));
+        assert!(sim.history.events().iter().any(|(_, event)| {
+            matches!(
+                event,
+                RuntimeEvents::ClientCompleted {
+                    client: NodeId(0),
+                    request_number: 1,
+                    result: Op::Set(key, 7),
+                } if key == "k"
+            )
+        }));
     }
 
     #[test]

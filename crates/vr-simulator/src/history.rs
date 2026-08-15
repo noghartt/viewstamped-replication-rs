@@ -30,6 +30,16 @@ pub enum RuntimeEvents<
     ReplicaSnapshot {
         snapshot: ReplicaSnapshot,
     },
+    ClientInvoked {
+        client: NodeId,
+        request_number: usize,
+        op: Input,
+    },
+    ClientCompleted {
+        client: NodeId,
+        request_number: usize,
+        result: Output,
+    },
 }
 
 #[derive(Debug)]
@@ -174,6 +184,28 @@ impl<Input: Clone + fmt::Debug + 'static, Output: Clone + fmt::Debug + 'static> 
                         snapshot.op_number,
                         snapshot.commit_number,
                         snapshot.log.len(),
+                    )?;
+                }
+                RuntimeEvents::ClientInvoked {
+                    client,
+                    request_number,
+                    op,
+                } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]   C{:?} request_number={request_number} op={op:?}",
+                        client,
+                    )?;
+                }
+                RuntimeEvents::ClientCompleted {
+                    client,
+                    request_number,
+                    result,
+                } => {
+                    writeln!(
+                        f,
+                        "[t={at:>5}]   C{:?} request_number={request_number} result={:?}",
+                        client, result,
                     )?;
                 }
             }
